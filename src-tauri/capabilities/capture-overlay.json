@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "capture-overlay",
+  "description": "Minimal permissions for the temporary screenshot region overlay",
+  "windows": ["capture-region"],
+  "permissions": ["core:default"]
+}
