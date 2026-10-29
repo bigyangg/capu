@@ -1,6 +1,6 @@
 [package]
 name = "screenshot_memory"
-version = "0.1.0"
+version = "0.1.1"
 description = "Private local search for your screenshots"
 authors = ["you"]
 edition = "2024"
