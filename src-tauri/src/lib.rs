@@ -305,6 +305,9 @@ pub fn run() {
                 if report.imported > 0 {
                     let _ = startup_app.emit("library-changed", report.imported.to_string());
                 }
+                if report.removed > 0 {
+                    let _ = startup_app.emit("library-items-removed", report.removed.to_string());
+                }
             });
 
             let full_screen =
@@ -453,6 +456,8 @@ pub fn run() {
             library::save_ocr_text,
             library::save_semantic_embedding,
             library::get_unembedded_texts,
+            library::save_image_embedding,
+            library::get_unembedded_images,
             library::mark_ocr_failed,
             get_capture_display_mode,
             set_capture_display_mode,

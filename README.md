@@ -1,19 +1,19 @@
 # Screenshot Memory
 
-Screenshot Memory is a local-first desktop app for capturing, organizing, and finding screenshots. It keeps a managed library on the device, indexes screenshot text locally, and lets you search by words you remember.
+Screenshot Memory is a local-first desktop app for capturing, organizing, and finding screenshots. It keeps a managed library on the device, indexes screenshot text and images locally, and lets you search by words you remember or by describing what a screenshot shows.
 
 ## How it works
 
 - **Capture in the app:** `Ctrl + Shift + S` captures the active display (or all displays, depending on Capture settings). `Ctrl + Shift + R` opens region selection. Captures are saved directly into the app's managed library.
-- **Import automatically:** On Windows, the app watches the standard `Pictures/Screenshots` folder used by Snipping Tool. New image files are copied into the managed library as they appear. If Snipping Tool is configured to save somewhere else, add that folder in the app's library settings.
-- **Import another folder:** Choose **Import folder** to add a folder to the watch list. Existing supported images are copied into the library, and new files are watched afterward. Source files stay where they are.
-- **Find screenshots:** Local OCR extracts text in the background. Search combines full-text search with a locally generated text embedding to help find related wording. The app can suggest categories and subcategories from OCR text; suggestions can be changed in the UI.
+- **Import automatically:** On Windows, the app watches the standard `Pictures/Screenshots` folder used by Snipping Tool. New image files are added to the managed library as they appear. If Snipping Tool is configured to save somewhere else, add that folder in the app's library settings.
+- **Import another folder:** Choose **Import folder** to add a folder to the watch list. Existing supported images are added to the library, and new files are watched afterward. Source files stay where they are.
+- **Find screenshots:** Local OCR extracts text in the background. Search combines full-text search, a locally generated text embedding for related wording, and a local CLIP image embedding so you can describe what a screenshot shows. The app can suggest categories and subcategories from OCR text; suggestions can be changed in the UI.
 
 The app does not need an existing screenshot folder to start. You can use the managed capture library immediately and add import folders when you want.
 
 ## Privacy and storage
 
-Screenshot files, OCR, search, category suggestions, and semantic embeddings are processed on the device. OCR and embedding model assets are bundled with the app; runtime model downloads and remote OCR services are disabled. Screenshot contents and recognized text are not uploaded.
+Screenshot files, OCR, search, category suggestions, and text and image embeddings are processed on the device. OCR and embedding model assets are bundled with the app; runtime model downloads and remote OCR services are disabled. Screenshot contents and recognized text are not uploaded.
 
 The app stores its local database, managed captures, and thumbnail cache under the operating system's Tauri application data directory:
 
@@ -24,7 +24,7 @@ The app stores its local database, managed captures, and thumbnail cache under t
 `-- thumbnails/
 ```
 
-The exact parent directory is chosen by the operating system and application identifier. Imported screenshots are copied and deduplicated by file hash. Original files are not moved, renamed, or edited. Removing a watched folder stops future imports; it does not remove source files.
+The exact parent directory is chosen by the operating system and application identifier. Imported screenshots are deduplicated by file hash. When the original is on the same drive as the library and is not in a cloud-synced folder such as OneDrive, the library stores a hard link, so the image is kept once on disk. Otherwise it stores a verified copy. Original files are not moved, renamed, or edited. If an original is deleted from a watched folder, its library entry, thumbnail, search text, and embedding are removed too. This happens immediately while the app runs, or at the next launch. Renamed or moved originals keep their library entry, and an original edited in place replaces its earlier version. Nothing is removed while a watched folder itself is unavailable, for example on an unplugged drive. Removing a watched folder stops future imports; it does not remove source files or imported screenshots.
 
 ## Search and organization
 
@@ -32,7 +32,7 @@ Supported image types: PNG, JPG/JPEG, WebP, BMP, GIF (first frame), and TIFF.
 
 OCR currently uses the bundled English language data. Categories include Projects, Finance, Meetings, Development, and Reference, with supported subcategories defined by the application. Category suggestions are lightweight rules based on recognized text, so they can miss content or suggest the wrong folder; users can correct them.
 
-Search is based on recognized text and local text embeddings. It does not visually understand an image, recover words OCR missed, or perform image similarity search. A screenshot with little or no readable text may have limited search results.
+Search combines three local signals: exact words from recognized text, related wording from a text embedding (MiniLM), and visual similarity from a CLIP image embedding. With the visual signal, a description such as "night moon" can find a photo of the moon even when the image has no readable text. Visual matches are labeled "Visual match". CLIP is a general-purpose model, so visual search works best for clear subjects and scenes and is less reliable for fine details. It does not write captions or recover words OCR missed. Each new screenshot is indexed for visual search in the background, in a separate worker from OCR.
 
 ## Keyboard shortcuts
 
@@ -77,7 +77,7 @@ Build the native executable without packaging it:
 npm run tauri -- build --no-bundle
 ```
 
-The predev and prebuild steps run `scripts/copy-ocr-assets.mjs`, which stages the Tesseract worker, OCR engine files, English language data, and ONNX WebAssembly runtime for local use. The MiniLM model is kept under `public/models/` and is also used locally. Do not remove these assets or configure runtime CDN/model access without revisiting the offline privacy requirement.
+The predev and prebuild steps run `scripts/copy-ocr-assets.mjs`, which stages the Tesseract worker, OCR engine files, English language data, and ONNX WebAssembly runtime for local use. The MiniLM model is kept under `public/models/` and is also used locally. They first run `scripts/fetch-vision-model.mjs`, which downloads the CLIP visual search model (about 150 MB) from a pinned Hugging Face revision into `public/models/` and verifies each file's SHA-256 hash. This needs network access once; later builds reuse the verified files. The app itself never downloads models. Do not remove these assets or configure runtime CDN/model access without revisiting the offline privacy requirement.
 
 ## Platform status
 
@@ -91,12 +91,13 @@ App Store / Microsoft Store submission, signing, notarization, and release distr
 | --- | --- |
 | `src/App.tsx` | Main React UI, library state, commands, OCR worker coordination |
 | `src/App.css` | Application and gallery styling |
-| `src/ocr.worker.ts` | Local OCR and text-embedding work outside the UI thread |
+| `src/ocr.worker.ts` | Local OCR, text-embedding, and CLIP visual-embedding work outside the UI thread |
 | `src-tauri/src/lib.rs` | Tauri setup, commands, shortcuts, tray, autostart, app state |
 | `src-tauri/src/capture.rs` | Native full-display and region capture |
 | `src-tauri/src/folder_watch.rs` | Monitored-folder events and automatic imports |
-| `src-tauri/src/library.rs` | SQLite, file imports, thumbnails, OCR metadata, search and categories |
+| `src-tauri/src/library.rs` | SQLite, file imports, deleted-original cleanup, thumbnails, OCR metadata, text/visual search and categories |
 | `scripts/copy-ocr-assets.mjs` | Stage local OCR and ONNX assets for development/build |
+| `scripts/fetch-vision-model.mjs` | Download and SHA-256-verify the pinned CLIP model at build time |
 | `THIRD_PARTY_NOTICES.md` | Third-party components and licenses |
 
 See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dependency notices.

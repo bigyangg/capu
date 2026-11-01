@@ -4,9 +4,9 @@
   "version": "0.1.1",
   "type": "module",
   "scripts": {
-    "predev": "node scripts/copy-ocr-assets.mjs",
+    "predev": "node scripts/fetch-vision-model.mjs && node scripts/copy-ocr-assets.mjs",
     "dev": "vite",
-    "prebuild": "node scripts/copy-ocr-assets.mjs",
+    "prebuild": "node scripts/fetch-vision-model.mjs && node scripts/copy-ocr-assets.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"

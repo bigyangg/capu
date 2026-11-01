@@ -11,6 +11,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::State;
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
+/// MiniLM sentence vectors built from OCR text.
+const TEXT_EMBEDDING_DIMENSIONS: usize = 384;
+/// CLIP ViT-B/32 vectors; images and search text share this space.
+const IMAGE_EMBEDDING_DIMENSIONS: usize = 512;
+/// CLIP text-to-image similarity is low in absolute terms. On sample images, matches
+/// scored about 0.24-0.31 and unrelated images 0.16-0.22.
+const VISUAL_MATCH_FLOOR: f32 = 0.23;
+/// Keeps only images close to the best visual match, so a weak query does not return
+/// everything that clears the floor.
+const VISUAL_MATCH_MARGIN: f32 = 0.05;
 
 #[derive(Serialize)]
 pub struct Screenshot {
@@ -38,6 +48,12 @@ pub struct SemanticText {
 }
 
 #[derive(Serialize)]
+pub struct ImageEmbeddingJob {
+    pub id: i64,
+    pub image_data_url: String,
+}
+
+#[derive(Serialize)]
 pub struct IndexReport {
     discovered: usize,
     indexed: usize,
@@ -51,6 +67,7 @@ pub struct ImportSummary {
     pub imported: usize,
     pub duplicates: usize,
     pub failed: usize,
+    pub removed: usize,
     pub monitored_folders: Vec<String>,
 }
 
@@ -91,6 +108,10 @@ pub fn initialize_database(path: &Path) -> Result<(), String> {
              screenshot_id INTEGER PRIMARY KEY REFERENCES screenshots(id) ON DELETE CASCADE,
              vector BLOB NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS screenshot_image_embeddings (
+             screenshot_id INTEGER PRIMARY KEY REFERENCES screenshots(id) ON DELETE CASCADE,
+             vector BLOB NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS monitored_folders (
              path TEXT PRIMARY KEY NOT NULL
          );
@@ -110,6 +131,7 @@ pub fn initialize_database(path: &Path) -> Result<(), String> {
         ("suggested_category", "TEXT"),
         ("suggested_subcategory", "TEXT"),
         ("category_is_manual", "INTEGER NOT NULL DEFAULT 0"),
+        ("source_path", "TEXT"),
     ] {
         let exists: bool = conn
             .query_row(
@@ -125,6 +147,10 @@ pub fn initialize_database(path: &Path) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         }
     }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS screenshots_source ON screenshots(source_path);",
+    )
+    .map_err(|error| error.to_string())?;
 
     let mut statement = conn
         .prepare(
@@ -543,6 +569,7 @@ pub async fn search_screenshots(
     state: State<'_, AppState>,
     query: String,
     embedding: Vec<f32>,
+    image_query_embedding: Vec<f32>,
 ) -> Result<Vec<Screenshot>, String> {
     let db_path = state.db_path.clone();
     let thumbnail_dir = state.thumbnail_dir.clone();
@@ -577,7 +604,9 @@ pub async fn search_screenshots(
                     .map(|term| format!("\"{term}\"*")),
             );
         }
-        if search_terms.is_empty() && embedding.len() != 384 {
+        let text_vector = is_valid_vector(&embedding, TEXT_EMBEDDING_DIMENSIONS);
+        let image_vector = is_valid_vector(&image_query_embedding, IMAGE_EMBEDDING_DIMENSIONS);
+        if search_terms.is_empty() && !text_vector && !image_vector {
             return load_screenshots(&db_path, &thumbnail_dir, None);
         }
         let text_matches = if search_terms.is_empty() {
@@ -605,25 +634,9 @@ pub async fn search_screenshots(
                 .to_string(),
             );
         }
-        if embedding.len() == 384 && embedding.iter().all(|value| value.is_finite()) {
-            let conn = connection(&db_path)?;
-            let mut statement = conn
-                .prepare("SELECT screenshot_id,vector FROM screenshot_embeddings")
-                .map_err(|error| error.to_string())?;
-            let mut rows = statement.query([]).map_err(|error| error.to_string())?;
-            while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-                let id: i64 = row.get(0).map_err(|error| error.to_string())?;
-                let bytes: Vec<u8> = row.get(1).map_err(|error| error.to_string())?;
-                if bytes.len() != 384 * 4 {
-                    continue;
-                }
-                let similarity = bytes
-                    .chunks_exact(4)
-                    .zip(&embedding)
-                    .map(|(bytes, query)| {
-                        f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) * query
-                    })
-                    .sum::<f32>();
+        let conn = connection(&db_path)?;
+        if text_vector {
+            for (id, similarity) in similarities(&conn, VectorTable::Text, &embedding)? {
                 if similarity >= 0.24 {
                     scores
                         .entry(id)
@@ -633,6 +646,17 @@ pub async fn search_screenshots(
                         .entry(id)
                         .or_insert_with(|| "Related meaning".to_string());
                 }
+            }
+        }
+        if image_vector {
+            for (id, score) in visual_matches(&conn, &image_query_embedding)? {
+                scores
+                    .entry(id)
+                    .and_modify(|current| *current += score)
+                    .or_insert(score);
+                reasons
+                    .entry(id)
+                    .or_insert_with(|| "Visual match".to_string());
             }
         }
         let mut ranked = scores.into_iter().collect::<Vec<_>>();
@@ -784,7 +808,7 @@ pub fn save_ocr_text(
     let mut conn = connection(&state.db_path)?;
     let transaction = conn.transaction().map_err(|error| error.to_string())?;
     let (suggestion, suggested_subcategory) = suggest_category(&text);
-    transaction
+    let updated = transaction
         .execute(
             "UPDATE screenshots SET ocr_text=?1, status='indexed', last_error=NULL,
              suggested_category=?2,suggested_subcategory=?3,
@@ -793,6 +817,10 @@ pub fn save_ocr_text(
             params![text, suggestion, suggested_subcategory, id],
         )
         .map_err(|error| error.to_string())?;
+    // The screenshot may have been removed while OCR was running.
+    if updated == 0 {
+        return Ok(());
+    }
     if let Some(vector) = embedding {
         store_embedding(&transaction, id, &vector)?;
     }
@@ -809,21 +837,162 @@ pub fn save_ocr_text(
     transaction.commit().map_err(|error| error.to_string())
 }
 
-fn store_embedding(conn: &Connection, id: i64, vector: &[f32]) -> Result<(), String> {
-    if vector.len() != 384 || vector.iter().any(|value| !value.is_finite()) {
-        return Err("The local meaning model returned an invalid vector.".to_string());
+#[derive(Clone, Copy)]
+enum VectorTable {
+    Text,
+    Image,
+}
+
+impl VectorTable {
+    fn dimensions(self) -> usize {
+        match self {
+            Self::Text => TEXT_EMBEDDING_DIMENSIONS,
+            Self::Image => IMAGE_EMBEDDING_DIMENSIONS,
+        }
+    }
+
+    fn insert_sql(self) -> &'static str {
+        match self {
+            Self::Text => {
+                "INSERT INTO screenshot_embeddings(screenshot_id,vector)
+                 SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM screenshots WHERE id=?1)
+                 ON CONFLICT(screenshot_id) DO UPDATE SET vector=excluded.vector"
+            }
+            Self::Image => {
+                "INSERT INTO screenshot_image_embeddings(screenshot_id,vector)
+                 SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM screenshots WHERE id=?1)
+                 ON CONFLICT(screenshot_id) DO UPDATE SET vector=excluded.vector"
+            }
+        }
+    }
+
+    fn select_sql(self) -> &'static str {
+        match self {
+            Self::Text => "SELECT screenshot_id,vector FROM screenshot_embeddings",
+            Self::Image => "SELECT screenshot_id,vector FROM screenshot_image_embeddings",
+        }
+    }
+}
+
+fn is_valid_vector(vector: &[f32], dimensions: usize) -> bool {
+    vector.len() == dimensions && vector.iter().all(|value| value.is_finite())
+}
+
+fn store_vector(conn: &Connection, table: VectorTable, id: i64, vector: &[f32]) -> Result<(), String> {
+    if !is_valid_vector(vector, table.dimensions()) {
+        return Err("The local model returned an invalid vector.".to_string());
     }
     let bytes = vector
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    conn.execute(
-        "INSERT INTO screenshot_embeddings(screenshot_id,vector) VALUES(?1,?2)
-         ON CONFLICT(screenshot_id) DO UPDATE SET vector=excluded.vector",
-        params![id, bytes],
-    )
-    .map_err(|error| error.to_string())?;
+    conn.execute(table.insert_sql(), params![id, bytes])
+        .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn store_embedding(conn: &Connection, id: i64, vector: &[f32]) -> Result<(), String> {
+    store_vector(conn, VectorTable::Text, id, vector)
+}
+
+/// Dot product against every stored vector. Stored and query vectors are normalized, so
+/// this is cosine similarity.
+fn similarities(
+    conn: &Connection,
+    table: VectorTable,
+    query: &[f32],
+) -> Result<Vec<(i64, f32)>, String> {
+    let mut statement = conn
+        .prepare(table.select_sql())
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+    let mut found = Vec::new();
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let id: i64 = row.get(0).map_err(|error| error.to_string())?;
+        let bytes: Vec<u8> = row.get(1).map_err(|error| error.to_string())?;
+        if bytes.len() != table.dimensions() * 4 {
+            continue;
+        }
+        let similarity = bytes
+            .chunks_exact(4)
+            .zip(query)
+            .map(|(bytes, query)| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) * query)
+            .sum::<f32>();
+        found.push((id, similarity));
+    }
+    Ok(found)
+}
+
+/// Screenshots that look like the query, with a score that ranks alongside text matches.
+fn visual_matches(conn: &Connection, query: &[f32]) -> Result<Vec<(i64, f32)>, String> {
+    let visual = similarities(conn, VectorTable::Image, query)?;
+    let best = visual
+        .iter()
+        .map(|(_, similarity)| *similarity)
+        .fold(f32::MIN, f32::max);
+    let cutoff = VISUAL_MATCH_FLOOR.max(best - VISUAL_MATCH_MARGIN);
+    Ok(visual
+        .into_iter()
+        .filter(|(_, similarity)| *similarity >= cutoff)
+        // Rescale CLIP's narrow 0.23-0.32 band to roughly 0.4-0.85 so strong visual
+        // matches rank alongside related-meaning matches.
+        .map(|(id, similarity)| (id, (similarity - 0.15) * 5.0))
+        .collect())
+}
+
+#[tauri::command]
+pub fn save_image_embedding(
+    state: State<'_, AppState>,
+    id: i64,
+    embedding: Vec<f32>,
+) -> Result<(), String> {
+    let conn = connection(&state.db_path)?;
+    store_vector(&conn, VectorTable::Image, id, &embedding)
+}
+
+/// Returns a small batch of screenshots that still need a visual search vector, with
+/// their thumbnails. The vision model works on 224px input, so the thumbnail carries
+/// enough detail and avoids sending full-size images to the web view.
+#[tauri::command]
+pub async fn get_unembedded_images(
+    state: State<'_, AppState>,
+    exclude: Vec<i64>,
+) -> Result<Vec<ImageEmbeddingJob>, String> {
+    let db_path = state.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = connection(&db_path)?;
+        let mut statement = conn
+            .prepare(
+                "SELECT id,thumbnail_path FROM screenshots s
+                 WHERE thumbnail_path IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM screenshot_image_embeddings e WHERE e.screenshot_id=s.id
+                 ) ORDER BY captured_at DESC",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| error.to_string())?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let (id, thumbnail) = row.map_err(|error| error.to_string())?;
+            if exclude.contains(&id) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&thumbnail) else {
+                continue;
+            };
+            jobs.push(ImageEmbeddingJob {
+                id,
+                image_data_url: format!("data:image/jpeg;base64,{}", BASE64.encode(bytes)),
+            });
+            if jobs.len() == 16 {
+                break;
+            }
+        }
+        Ok(jobs)
+    })
+    .await
+    .map_err(|error| format!("Visual search task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -954,15 +1123,31 @@ pub fn import_monitored_file(
     let (size, modified) = wait_for_import_stable(&source)?;
     let hash = hash_file(&source)?;
     let conn = connection(db_path)?;
-    let already_imported: Option<i64> = conn
+    let source_text = source.to_string_lossy().into_owned();
+    let already_imported: Option<(i64, String, Option<String>)> = conn
         .query_row(
-            "SELECT id FROM screenshots WHERE file_hash=?1 LIMIT 1",
+            "SELECT id,file_name,source_path FROM screenshots WHERE file_hash=?1 LIMIT 1",
             [&hash],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    if already_imported.is_some() {
+    if let Some((id, file_name, current_source)) = already_imported {
+        // Track where an imported file lives now: this backfills imports made before
+        // sources were recorded and follows originals that were renamed or moved.
+        // Native captures are never tied to a source, so deleting a copy of one in a
+        // monitored folder cannot remove it from the library.
+        if file_name.starts_with("Imported-")
+            && current_source
+                .as_deref()
+                .is_none_or(|current| current != source_text && source_is_gone(Path::new(current)))
+        {
+            conn.execute(
+                "UPDATE screenshots SET source_path=?1 WHERE id=?2",
+                params![source_text, id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
         return Ok(ImportOutcome::Duplicate);
     }
 
@@ -1000,37 +1185,58 @@ pub fn import_monitored_file(
     if destination.exists() {
         if hash_file(&destination)? == hash {
             return match index_one(&conn, thumbnail_dir, &destination)? {
-                ScanOutcome::Indexed => Ok(ImportOutcome::Imported),
+                ScanOutcome::Indexed => {
+                    record_import_source(&conn, thumbnail_dir, capture_dir, &source, &destination)?;
+                    Ok(ImportOutcome::Imported)
+                }
                 ScanOutcome::Duplicate => Ok(ImportOutcome::Duplicate),
                 ScanOutcome::Skipped => Ok(ImportOutcome::Skipped),
             };
         }
         return Err("A managed screenshot with the same fingerprint already exists.".to_string());
     }
-    let temporary = capture_dir.join(format!(".import-{hash}.part"));
-    fs::copy(&source, &temporary).map_err(|error| error.to_string())?;
-    let copied_size = fs::metadata(&temporary)
-        .map_err(|error| error.to_string())?
-        .len();
-    if copied_size != size || hash_file(&temporary)? != hash {
-        let _ = fs::remove_file(&temporary);
-        return Err(
-            "The screenshot changed while it was being imported. It will be retried.".to_string(),
-        );
-    }
-    fs::rename(&temporary, &destination).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        error.to_string()
-    })?;
-    if let Err(error) =
-        filetime::set_file_mtime(&destination, filetime::FileTime::from_system_time(modified))
-    {
-        let _ = fs::remove_file(&destination);
-        return Err(error.to_string());
+    // A hard link stores the image once on disk while still keeping the library entry
+    // when the original is deleted. It needs the same volume and a regular local file,
+    // so anything else falls back to a verified copy.
+    if supports_hard_link(&source) && fs::hard_link(&source, &destination).is_ok() {
+        let linked = fs::metadata(&destination).map_err(|error| error.to_string())?;
+        if linked.len() != size || linked.modified().ok() != Some(modified) {
+            let _ = fs::remove_file(&destination);
+            return Err(
+                "The screenshot changed while it was being imported. It will be retried."
+                    .to_string(),
+            );
+        }
+    } else {
+        let temporary = capture_dir.join(format!(".import-{hash}.part"));
+        fs::copy(&source, &temporary).map_err(|error| error.to_string())?;
+        let copied_size = fs::metadata(&temporary)
+            .map_err(|error| error.to_string())?
+            .len();
+        if copied_size != size || hash_file(&temporary)? != hash {
+            let _ = fs::remove_file(&temporary);
+            return Err(
+                "The screenshot changed while it was being imported. It will be retried."
+                    .to_string(),
+            );
+        }
+        fs::rename(&temporary, &destination).map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            error.to_string()
+        })?;
+        if let Err(error) =
+            filetime::set_file_mtime(&destination, filetime::FileTime::from_system_time(modified))
+        {
+            let _ = fs::remove_file(&destination);
+            return Err(error.to_string());
+        }
     }
 
     match index_one(&conn, thumbnail_dir, &destination) {
-        Ok(ScanOutcome::Indexed) => Ok(ImportOutcome::Imported),
+        Ok(ScanOutcome::Indexed) => {
+            record_import_source(&conn, thumbnail_dir, capture_dir, &source, &destination)?;
+            Ok(ImportOutcome::Imported)
+        }
         Ok(ScanOutcome::Duplicate) => {
             let _ = fs::remove_file(&destination);
             Ok(ImportOutcome::Duplicate)
@@ -1104,6 +1310,225 @@ fn hash_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn source_is_gone(path: &Path) -> bool {
+    matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+#[cfg(windows)]
+fn supports_hard_link(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    // Cloud-synced files are copied instead of linked. The sync client can later turn a
+    // local file into an online-only placeholder, and every hard link shares that change.
+    // OneDrive folders are excluded by location because a fully local file there carries
+    // no cloud attributes until that happens.
+    const UNLINKABLE: u32 = 0x400 // FILE_ATTRIBUTE_REPARSE_POINT
+        | 0x1000 // FILE_ATTRIBUTE_OFFLINE
+        | 0x40000 // FILE_ATTRIBUTE_RECALL_ON_OPEN
+        | 0x80000 // FILE_ATTRIBUTE_PINNED
+        | 0x100000 // FILE_ATTRIBUTE_UNPINNED
+        | 0x400000; // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+    let in_onedrive = ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .any(|root| path.starts_with(root));
+    !in_onedrive
+        && fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_attributes() & UNLINKABLE == 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn supports_hard_link(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+}
+
+fn record_import_source(
+    conn: &Connection,
+    thumbnail_dir: &Path,
+    capture_dir: &Path,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), String> {
+    let source_text = source.to_string_lossy().into_owned();
+    let destination_text = fs::canonicalize(destination)
+        .map_err(|error| error.to_string())?
+        .to_string_lossy()
+        .into_owned();
+    conn.execute(
+        "UPDATE screenshots SET source_path=?1 WHERE path=?2",
+        params![source_text, destination_text],
+    )
+    .map_err(|error| error.to_string())?;
+
+    // An original edited in place replaces the version imported before it. A category
+    // chosen by hand carries over to the new version.
+    let mut statement = conn
+        .prepare(
+            "SELECT id,path,thumbnail_path,category_is_manual,category,subcategory
+             FROM screenshots WHERE source_path=?1 AND path!=?2",
+        )
+        .map_err(|error| error.to_string())?;
+    let previous = statement
+        .query_map(params![source_text, destination_text], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    for (id, path, thumbnail, manual, category, subcategory) in previous {
+        if manual {
+            conn.execute(
+                "UPDATE screenshots SET category_is_manual=1,category=?1,subcategory=?2 WHERE path=?3",
+                params![category, subcategory, destination_text],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        delete_library_item(conn, thumbnail_dir, capture_dir, id, &path, thumbnail.as_deref())?;
+    }
+    Ok(())
+}
+
+/// Removes a screenshot and everything derived from it: search text, embedding,
+/// thumbnail, and the managed library file. Files outside the managed library are never
+/// deleted.
+fn delete_library_item(
+    conn: &Connection,
+    thumbnail_dir: &Path,
+    capture_dir: &Path,
+    id: i64,
+    path: &str,
+    thumbnail_path: Option<&str>,
+) -> Result<(), String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM screenshot_fts WHERE screenshot_id=?1", [id])
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM screenshot_embeddings WHERE screenshot_id=?1", [id])
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM screenshot_image_embeddings WHERE screenshot_id=?1", [id])
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute("DELETE FROM screenshots WHERE id=?1", [id])
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
+
+    let managed_root = fs::canonicalize(capture_dir).unwrap_or_else(|_| capture_dir.to_path_buf());
+    let library_file = Path::new(path);
+    if library_file.starts_with(&managed_root) && library_file.is_file() {
+        let _ = fs::remove_file(library_file);
+    }
+    if let Some(thumbnail) = thumbnail_path {
+        let still_used: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM screenshots WHERE thumbnail_path=?1)",
+                [thumbnail],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !still_used && Path::new(thumbnail).starts_with(thumbnail_dir) {
+            let _ = fs::remove_file(thumbnail);
+        }
+    }
+    Ok(())
+}
+
+fn remove_items_with_missing_sources(
+    db_path: &Path,
+    thumbnail_dir: &Path,
+    capture_dir: &Path,
+    belongs: impl Fn(&Path) -> bool,
+) -> Result<usize, String> {
+    let conn = connection(db_path)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id,path,source_path,thumbnail_path FROM screenshots WHERE source_path IS NOT NULL",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    drop(statement);
+    let mut removed = 0;
+    for (id, path, source, thumbnail) in rows {
+        let source = Path::new(&source);
+        if belongs(source) && source_is_gone(source) {
+            delete_library_item(&conn, thumbnail_dir, capture_dir, id, &path, thumbnail.as_deref())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Handles a monitored path that no longer exists. A deleted file or folder removes the
+/// screenshots imported from it. Nothing is removed while the monitored root itself is
+/// unavailable, because that usually means an unplugged drive rather than a deletion.
+pub fn remove_deleted_source(
+    db_path: &Path,
+    thumbnail_dir: &Path,
+    capture_dir: &Path,
+    monitored_roots: &[PathBuf],
+    removed: &Path,
+) -> Result<usize, String> {
+    // The removed path cannot be canonicalized, so resolve its parent to match the
+    // canonical form stored for sources.
+    let removed = match (
+        removed.parent().and_then(|parent| fs::canonicalize(parent).ok()),
+        removed.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => removed.to_path_buf(),
+    };
+    let available_root = monitored_roots
+        .iter()
+        .any(|root| removed.starts_with(root) && removed != *root && root.is_dir());
+    if !available_root || !source_is_gone(&removed) {
+        return Ok(0);
+    }
+    remove_items_with_missing_sources(db_path, thumbnail_dir, capture_dir, |source| {
+        source.starts_with(&removed)
+    })
+}
+
+/// Removes screenshots whose originals were deleted while the app was not running.
+fn reconcile_deleted_sources(
+    db_path: &Path,
+    thumbnail_dir: &Path,
+    capture_dir: &Path,
+    roots: &[PathBuf],
+) -> Result<usize, String> {
+    let available = roots.iter().filter(|root| root.is_dir()).collect::<Vec<_>>();
+    if available.is_empty() {
+        return Ok(0);
+    }
+    remove_items_with_missing_sources(db_path, thumbnail_dir, capture_dir, |source| {
+        available.iter().any(|root| source.starts_with(root))
+    })
+}
+
 pub fn import_monitored_folders(
     db_path: &Path,
     thumbnail_dir: &Path,
@@ -1114,6 +1539,7 @@ pub fn import_monitored_folders(
         imported: 0,
         duplicates: 0,
         failed: 0,
+        removed: 0,
         monitored_folders: roots
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
@@ -1133,6 +1559,12 @@ pub fn import_monitored_folders(
                 Err(_) => summary.failed += 1,
             }
         }
+    }
+    // Reconcile after importing so renamed originals are re-pointed before missing
+    // sources are treated as deletions.
+    match reconcile_deleted_sources(db_path, thumbnail_dir, capture_dir, roots) {
+        Ok(removed) => summary.removed = removed,
+        Err(_) => summary.failed += 1,
     }
     summary
 }
@@ -1203,6 +1635,13 @@ fn index_one(conn: &Connection, thumbnail_dir: &Path, path: &Path) -> Result<Sca
         if let Some((id, _, _, _)) = existing {
             conn.execute("DELETE FROM screenshot_fts WHERE screenshot_id = ?1", [id])
                 .map_err(|error| error.to_string())?;
+            conn.execute("DELETE FROM screenshot_embeddings WHERE screenshot_id = ?1", [id])
+                .map_err(|error| error.to_string())?;
+            conn.execute(
+                "DELETE FROM screenshot_image_embeddings WHERE screenshot_id = ?1",
+                [id],
+            )
+            .map_err(|error| error.to_string())?;
             conn.execute("DELETE FROM screenshots WHERE id = ?1", [id])
                 .map_err(|error| error.to_string())?;
         }
@@ -1233,6 +1672,11 @@ fn index_one(conn: &Connection, thumbnail_dir: &Path, path: &Path) -> Result<Sca
                 .map_err(|error| error.to_string())?;
             conn.execute(
                 "DELETE FROM screenshot_embeddings WHERE screenshot_id=?1",
+                [id],
+            )
+            .map_err(|error| error.to_string())?;
+            conn.execute(
+                "DELETE FROM screenshot_image_embeddings WHERE screenshot_id=?1",
                 [id],
             )
             .map_err(|error| error.to_string())?;
@@ -1309,6 +1753,10 @@ fn record_scan_error(conn: &Connection, path: &Path, error: &str) -> Result<(), 
     ).map_err(|issue| issue.to_string())?;
     conn.execute(
         "DELETE FROM screenshot_embeddings WHERE screenshot_id IN (SELECT id FROM screenshots WHERE path = ?1)",
+        [path.to_string_lossy().as_ref()],
+    ).map_err(|issue| issue.to_string())?;
+    conn.execute(
+        "DELETE FROM screenshot_image_embeddings WHERE screenshot_id IN (SELECT id FROM screenshots WHERE path = ?1)",
         [path.to_string_lossy().as_ref()],
     ).map_err(|issue| issue.to_string())?;
     Ok(())
@@ -1398,6 +1846,211 @@ fn screenshot_from_row(row: &rusqlite::Row<'_>) -> Result<Screenshot, rusqlite::
         category_is_manual: row.get::<_, i64>(13)? != 0,
         match_reason: None,
     })
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        watched: PathBuf,
+        captures: PathBuf,
+        thumbnails: PathBuf,
+        db: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "screenshot-memory-{name}-{}",
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            let (watched, captures, thumbnails) =
+                (root.join("watched"), root.join("captures"), root.join("thumbnails"));
+            for dir in [&watched, &captures, &thumbnails] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            let db = root.join("library.sqlite3");
+            initialize_database(&db).unwrap();
+            Self {
+                watched: fs::canonicalize(&watched).unwrap(),
+                captures: fs::canonicalize(&captures).unwrap(),
+                thumbnails,
+                db,
+                root,
+            }
+        }
+
+        fn image(&self, name: &str, shade: u8) -> PathBuf {
+            let path = self.watched.join(name);
+            image::RgbImage::from_pixel(8, 8, image::Rgb([shade, 0, 0]))
+                .save(&path)
+                .unwrap();
+            path
+        }
+
+        fn import(&self, source: &Path) -> ImportOutcome {
+            import_monitored_file(
+                &self.db,
+                &self.thumbnails,
+                &self.captures,
+                std::slice::from_ref(&self.watched),
+                source,
+            )
+            .unwrap()
+        }
+
+        fn remove(&self, source: &Path) -> usize {
+            remove_deleted_source(
+                &self.db,
+                &self.thumbnails,
+                &self.captures,
+                std::slice::from_ref(&self.watched),
+                source,
+            )
+            .unwrap()
+        }
+
+        fn rows(&self) -> Vec<(String, Option<String>)> {
+            let conn = connection(&self.db).unwrap();
+            let mut statement = conn
+                .prepare("SELECT path,source_path FROM screenshots")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn deleting_an_original_removes_its_library_entry_and_files() {
+        let fixture = Fixture::new("delete");
+        let source = fixture.image("shot.png", 10);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1);
+        let (library_path, recorded_source) = rows[0].clone();
+        assert_eq!(
+            recorded_source.as_deref(),
+            Some(fs::canonicalize(&source).unwrap().to_string_lossy().as_ref())
+        );
+
+        fs::remove_file(&source).unwrap();
+        assert!(
+            Path::new(&library_path).is_file(),
+            "the library entry outlives its original until the deletion is handled"
+        );
+        assert_eq!(fixture.remove(&source), 1);
+        assert!(fixture.rows().is_empty());
+        assert!(!Path::new(&library_path).exists());
+        assert_eq!(fs::read_dir(&fixture.thumbnails).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn renaming_an_original_keeps_its_library_entry() {
+        let fixture = Fixture::new("rename");
+        let source = fixture.image("before.png", 20);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        let renamed = fixture.watched.join("after.png");
+        fs::rename(&source, &renamed).unwrap();
+
+        assert!(fixture.import(&renamed) == ImportOutcome::Duplicate);
+        assert_eq!(fixture.remove(&source), 0);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1.as_deref(),
+            Some(renamed.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn edited_original_replaces_the_previous_version() {
+        let fixture = Fixture::new("edit");
+        let source = fixture.image("shot.png", 30);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        let (first_path, _) = fixture.rows()[0].clone();
+
+        fs::remove_file(&source).unwrap();
+        let source = fixture.image("shot.png", 40);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1);
+        assert_ne!(rows[0].0, first_path);
+        assert!(!Path::new(&first_path).exists());
+    }
+}
+
+#[cfg(test)]
+mod visual_search_tests {
+    use super::*;
+
+    /// A unit vector whose first two components are `x` and `y`, padded with zeros.
+    fn vector(x: f32, y: f32) -> Vec<f32> {
+        let length = (x * x + y * y).sqrt();
+        let mut values = vec![0.0; IMAGE_EMBEDDING_DIMENSIONS];
+        values[0] = x / length;
+        values[1] = y / length;
+        values
+    }
+
+    fn library_with_images(vectors: &[Vec<f32>]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE screenshots (id INTEGER PRIMARY KEY);
+             CREATE TABLE screenshot_image_embeddings (
+                 screenshot_id INTEGER PRIMARY KEY, vector BLOB NOT NULL
+             );",
+        )
+        .unwrap();
+        for (index, values) in vectors.iter().enumerate() {
+            let id = index as i64 + 1;
+            conn.execute("INSERT INTO screenshots(id) VALUES(?1)", [id]).unwrap();
+            store_vector(&conn, VectorTable::Image, id, values).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn keeps_only_images_close_to_the_best_match() {
+        // Similarities to the query (1, 0) are the x components: 0.30, 0.27, 0.21, 0.24.
+        let conn = library_with_images(&[
+            vector(0.30, (1.0f32 - 0.09).sqrt()),
+            vector(0.27, (1.0f32 - 0.0729).sqrt()),
+            vector(0.21, (1.0f32 - 0.0441).sqrt()),
+            vector(0.24, (1.0f32 - 0.0576).sqrt()),
+        ]);
+        let mut ids = visual_matches(&conn, &vector(1.0, 0.0))
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        // 0.24 clears the floor but is more than the margin below the best match.
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn returns_nothing_when_no_image_clears_the_floor() {
+        let conn = library_with_images(&[vector(0.20, (1.0f32 - 0.04).sqrt())]);
+        assert!(visual_matches(&conn, &vector(1.0, 0.0)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_vectors_of_the_wrong_size() {
+        let conn = library_with_images(&[]);
+        conn.execute("INSERT INTO screenshots(id) VALUES(1)", []).unwrap();
+        assert!(store_vector(&conn, VectorTable::Image, 1, &[0.5; TEXT_EMBEDDING_DIMENSIONS]).is_err());
+    }
 }
 
 #[cfg(test)]

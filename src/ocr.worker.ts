@@ -1,9 +1,22 @@
-import { env, pipeline, type FeatureExtractionPipelineType } from "@huggingface/transformers";
+import {
+  AutoProcessor,
+  AutoTokenizer,
+  CLIPTextModelWithProjection,
+  CLIPVisionModelWithProjection,
+  env,
+  pipeline,
+  RawImage,
+  type FeatureExtractionPipelineType,
+  type PreTrainedTokenizer,
+  type Processor,
+} from "@huggingface/transformers";
 import { createWorker } from "tesseract.js";
 
 type OcrRequest = { type: "ocr"; id: number; imageDataUrl: string };
 type EmbeddingRequest = { type: "embed"; id: number; text: string };
-type WorkerRequest = OcrRequest | EmbeddingRequest;
+type ImageEmbeddingRequest = { type: "image-embed"; id: number; imageDataUrl: string };
+type VisualQueryRequest = { type: "visual-query"; id: number; text: string };
+type WorkerRequest = OcrRequest | EmbeddingRequest | ImageEmbeddingRequest | VisualQueryRequest;
 type WorkerScope = {
   location: Location;
   postMessage: (message: unknown) => void;
@@ -13,7 +26,13 @@ type WorkerScope = {
 const scope = self as unknown as WorkerScope;
 let ocrWorker: Awaited<ReturnType<typeof createWorker>> | null = null;
 let semanticModel: FeatureExtractionPipelineType | null = null;
+let imageProcessor: Processor | null = null;
+let imageModel: CLIPVisionModelWithProjection | null = null;
+let visualTokenizer: PreTrainedTokenizer | null = null;
+let visualTextModel: CLIPTextModelWithProjection | null = null;
 let activeId = 0;
+
+const VISUAL_MODEL = "Xenova/clip-vit-base-patch32";
 
 function localAsset(path: string) {
   return new URL(`../${path}`, scope.location.href).toString();
@@ -35,16 +54,20 @@ async function getWorker() {
   return ocrWorker;
 }
 
+function useLocalModels() {
+  // All weights and WebAssembly files ship with the app; no model or runtime CDN is allowed.
+  env.allowRemoteModels = false;
+  env.allowLocalModels = true;
+  env.localModelPath = localAsset("models/");
+  const onnxConfig = env.backends.onnx as unknown as { wasm?: Record<string, unknown> };
+  onnxConfig.wasm ??= {};
+  onnxConfig.wasm.wasmPaths = localAsset("onnxruntime/");
+  onnxConfig.wasm.numThreads = 1;
+}
+
 async function getSemanticModel() {
   if (!semanticModel) {
-    // All weights and WebAssembly files ship with the app; no model or runtime CDN is allowed.
-    env.allowRemoteModels = false;
-    env.allowLocalModels = true;
-    env.localModelPath = localAsset("models/");
-    const onnxConfig = env.backends.onnx as unknown as { wasm?: Record<string, unknown> };
-    onnxConfig.wasm ??= {};
-    onnxConfig.wasm.wasmPaths = localAsset("onnxruntime/");
-    onnxConfig.wasm.numThreads = 1;
+    useLocalModels();
     const createFeaturePipeline = pipeline as unknown as (
       task: "feature-extraction",
       model: string,
@@ -59,6 +82,37 @@ async function embedText(text: string) {
   const model = await getSemanticModel();
   const result = await model(text.slice(0, 6000), { pooling: "mean", normalize: true });
   return Array.from(result.data as Float32Array);
+}
+
+function normalized(values: ArrayLike<number>) {
+  const vector = Array.from(values);
+  const length = Math.hypot(...vector) || 1;
+  return vector.map((value) => value / length);
+}
+
+// CLIP places images and text in one vector space, so a query such as "night moon" can
+// match pictures that contain no readable text. The image and text halves load
+// separately: indexing only needs the image half and searching only needs the text half.
+async function embedImage(imageDataUrl: string) {
+  if (!imageModel || !imageProcessor) {
+    useLocalModels();
+    imageProcessor = await AutoProcessor.from_pretrained(VISUAL_MODEL);
+    imageModel = await CLIPVisionModelWithProjection.from_pretrained(VISUAL_MODEL, { device: "wasm", dtype: "q8" });
+  }
+  const image = await RawImage.read(imageDataUrl);
+  const { image_embeds } = await imageModel(await imageProcessor(image));
+  return normalized(image_embeds.data as Float32Array);
+}
+
+async function embedVisualQuery(text: string) {
+  if (!visualTextModel || !visualTokenizer) {
+    useLocalModels();
+    visualTokenizer = await AutoTokenizer.from_pretrained(VISUAL_MODEL);
+    visualTextModel = await CLIPTextModelWithProjection.from_pretrained(VISUAL_MODEL, { device: "wasm", dtype: "q8" });
+  }
+  const inputs = visualTokenizer([text], { padding: "max_length", truncation: true });
+  const { text_embeds } = await visualTextModel(inputs);
+  return normalized(text_embeds.data as Float32Array);
 }
 
 async function imageTiles(imageDataUrl: string) {
@@ -107,6 +161,16 @@ async function processRequest(message: WorkerRequest) {
   try {
     if (message.type === "embed") {
       const embedding = await embedText(message.text);
+      scope.postMessage({ type: "embedding", id, embedding });
+      return;
+    }
+    if (message.type === "image-embed") {
+      const embedding = await embedImage(message.imageDataUrl);
+      scope.postMessage({ type: "embedding", id, embedding });
+      return;
+    }
+    if (message.type === "visual-query") {
+      const embedding = await embedVisualQuery(message.text);
       scope.postMessage({ type: "embedding", id, embedding });
       return;
     }

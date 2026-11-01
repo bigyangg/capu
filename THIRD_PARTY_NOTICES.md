@@ -9,3 +9,4 @@
 - `filetime` 0.2 is distributed under MIT or Apache License 2.0.
 - Transformers.js 3.8 and ONNX Runtime Web are distributed under Apache License 2.0 and MIT, respectively.
 - `Xenova/all-MiniLM-L6-v2` is distributed under Apache License 2.0. Its quantized ONNX weights and tokenizer are bundled locally under `public/models/`.
+- `Xenova/clip-vit-base-patch32`, an ONNX conversion of OpenAI's CLIP ViT-B/32, is distributed under MIT. Its quantized ONNX weights, tokenizer, and configuration are downloaded at build time from a pinned revision, verified by SHA-256, and bundled locally under `public/models/` for visual search.

@@ -24,7 +24,7 @@ impl FolderWatchService {
         let (sender, receiver) = mpsc::channel::<PathBuf>();
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
             if let Ok(event) = event
-                && (event.kind.is_create() || event.kind.is_modify())
+                && (event.kind.is_create() || event.kind.is_modify() || event.kind.is_remove())
             {
                 for path in event.paths {
                     let _ = sender.send(path);
@@ -63,12 +63,16 @@ impl FolderWatchService {
                         pending.insert(path, (Instant::now() + Duration::from_millis(500), 0));
                     }
                     let now = Instant::now();
-                    let ready = pending
+                    let mut ready = pending
                         .iter()
                         .filter(|(_, (retry_at, _))| *retry_at <= now)
                         .map(|(path, _)| path.clone())
                         .collect::<Vec<_>>();
+                    // Import new names before handling missing ones, so a renamed or moved
+                    // original re-points its library entry instead of being removed.
+                    ready.sort_by_key(|path| !path.exists());
                     let mut imported = 0;
+                    let mut removed = 0;
                     let mut first_failure = None;
                     for path in ready {
                         let attempts = pending
@@ -82,6 +86,23 @@ impl FolderWatchService {
                         let Ok(_guard) = import_lock.lock() else {
                             continue;
                         };
+                        if !path.exists() {
+                            match library::remove_deleted_source(
+                                &db_path,
+                                &thumbnail_dir,
+                                &capture_dir,
+                                &monitored,
+                                &path,
+                            ) {
+                                Ok(count) => removed += count,
+                                Err(error) => {
+                                    first_failure.get_or_insert_with(|| {
+                                        format!("{}: {error}", path.display())
+                                    });
+                                }
+                            }
+                            continue;
+                        }
                         match library::import_monitored_event(
                             &db_path,
                             &thumbnail_dir,
@@ -104,6 +125,9 @@ impl FolderWatchService {
                     }
                     if imported > 0 {
                         let _ = app.emit("library-changed", imported.to_string());
+                    }
+                    if removed > 0 {
+                        let _ = app.emit("library-items-removed", removed.to_string());
                     }
                     if let Some(error) = first_failure {
                         let _ = app.emit("folder-import-failed", error);

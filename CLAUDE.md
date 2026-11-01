@@ -2,7 +2,7 @@
 
 ## Project overview
 
-Screenshot Memory is a Tauri 2 desktop application with a React/TypeScript frontend and Rust native services. It captures screenshots, imports images into a managed local library, performs local OCR and text embedding, and stores/searches metadata in SQLite with FTS5.
+Screenshot Memory is a Tauri 2 desktop application with a React/TypeScript frontend and Rust native services. It captures screenshots, imports images into a managed local library, performs local OCR, text embedding, and CLIP image embedding for visual search, and stores/searches metadata in SQLite with FTS5.
 
 Read `README.md` for setup, user workflows, privacy behavior, and current platform status. Read `THIRD_PARTY_NOTICES.md` before changing dependencies or redistributing bundled assets.
 
@@ -10,18 +10,19 @@ Read `README.md` for setup, user workflows, privacy behavior, and current platfo
 
 - `src/App.tsx`: Main library UI, Tauri command calls, search state, capture and import flows, category presentation, worker lifecycle.
 - `src/App.css`: Frontend layout and visual styles.
-- `src/ocr.worker.ts`: Tesseract OCR and MiniLM embedding work. Keep CPU-heavy OCR/model work outside the UI thread.
+- `src/ocr.worker.ts`: Tesseract OCR, MiniLM text embedding, and CLIP image/query embedding work. Keep CPU-heavy OCR/model work outside the UI thread.
 - `src-tauri/src/lib.rs`: Tauri plugins and setup, app state, command registration, default Windows screenshot-folder setup, tray behavior, global shortcuts, autostart.
 - `src-tauri/src/capture.rs`: Native display capture and region selection.
-- `src-tauri/src/folder_watch.rs`: Monitored-folder events, debouncing/retries, and import notifications.
+- `src-tauri/src/folder_watch.rs`: Monitored-folder events (create/modify/remove), debouncing/retries, and import/removal notifications.
 - `src-tauri/src/library.rs`: SQLite schema and migrations, FTS5 search, indexing metadata, thumbnails, imports, duplicate detection, category rules, and persistence.
 - `src-tauri/capabilities/`: Tauri window permissions. Keep capabilities narrow and aligned with actual command/plugin needs.
 - `scripts/copy-ocr-assets.mjs`: Copies local OCR and ONNX assets into the frontend's public assets before dev/build.
+- `scripts/fetch-vision-model.mjs`: Downloads the pinned CLIP model into `public/models/` at build time and verifies each file by SHA-256. The app never downloads models at runtime.
 
 ## Product requirements to preserve
 
 1. **Local and private by default.** Screenshot bytes, OCR text, and embeddings stay on the device. Do not add remote OCR, analytics that include screenshot content, model CDN access, or cloud processing.
-2. **Preserve originals.** Capture files belong in the managed library. Imports copy files into it, detect duplicates using hashes, and leave source files untouched. Never move, rename, or delete user originals as part of import or indexing.
+2. **Preserve originals.** Capture files belong in the managed library. Imports add files to it (a hard link when the source is on the same non-cloud-synced volume, otherwise a verified copy), detect duplicates using hashes, and leave source files untouched. When an original is deleted from a watched folder, only its library entry and derived data are removed. Never move, rename, or delete user originals as part of import or indexing.
 3. **Reliable automatic import.** Monitored folder events may arrive while a screenshot is still being written. Preserve the existing debounce/retry behavior and avoid indexing incomplete files. Notify the UI through the established Tauri events when imports or captures change the library.
 4. **Keep slow work off the UI thread.** OCR and embedding run in the web worker; filesystem and SQLite work run in Rust commands/tasks. Avoid adding blocking work to React rendering or event handlers.
 5. **Safe persistence and paths.** Use parameterized SQLite queries. Validate caller-supplied paths against user-selected monitored roots and the managed library. Keep Tauri permissions scoped to the minimum necessary.
@@ -39,7 +40,7 @@ npm run tauri -- build
 npm run tauri -- build --no-bundle
 ```
 
-`npm run build` runs the asset-copy prebuild hook, TypeScript compiler, and Vite production build. `npm run tauri -- build` builds/packages the native app for the current host platform. A frontend build alone does not verify native Tauri behavior or another operating system.
+`npm run build` runs the prebuild hooks (CLIP model fetch/verify, which needs network once, and asset copy), TypeScript compiler, and Vite production build. `npm run tauri -- build` builds/packages the native app for the current host platform. A frontend build alone does not verify native Tauri behavior or another operating system.
 
 Use the package manager and scripts already in `package.json`. Do not introduce a dependency when the existing Tauri, React, Rust, SQLite, Tesseract.js, Transformers.js, or Lucide facilities can do the work.
 

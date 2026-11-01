@@ -63,6 +63,7 @@ type ImportSummary = {
   imported: number;
   duplicates: number;
   failed: number;
+  removed: number;
   monitored_folders: string[];
 };
 
@@ -255,33 +256,46 @@ function LibraryApp() {
   const [recentImportCount, setRecentImportCount] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const workerRef = useRef<Worker | null>(null);
+  // Visual search runs in its own worker so image indexing proceeds in parallel with OCR.
+  const visualWorkerRef = useRef<Worker | null>(null);
   const pendingJobs = useRef(new Map<number, (result: WorkerResult) => void>());
   const runningJobs = useRef(new Set<number>());
   const nextWorkerJobId = useRef(1_000_000_000);
   const semanticBackfillRunning = useRef(false);
+  const visualBackfillRunning = useRef(false);
+  const visualBackfillRequested = useRef(false);
+  const visualBackfillFailed = useRef(new Set<number>());
 
-  const requestEmbedding = useCallback((text: string) => {
-    const worker = workerRef.current;
-    if (!worker) return Promise.reject(new Error("Local meaning search is not ready."));
+  const requestVector = useCallback((worker: Worker | null, message: Record<string, unknown>) => {
+    if (!worker) return Promise.reject(new Error("Local search models are not ready."));
     const id = ++nextWorkerJobId.current;
     return new Promise<number[]>((resolve, reject) => {
       pendingJobs.current.set(id, (result) => {
         if (result.error) reject(new Error(result.error));
         else if (result.embedding) resolve(result.embedding);
-        else reject(new Error("The local meaning model returned no vector."));
+        else reject(new Error("The local model returned no vector."));
       });
-      worker.postMessage({ type: "embed", id, text });
+      worker.postMessage({ ...message, id });
     });
   }, []);
+
+  const requestEmbedding = useCallback(
+    (text: string) => requestVector(workerRef.current, { type: "embed", text }),
+    [requestVector],
+  );
 
   const refresh = useCallback(async (search = "") => {
     try {
       let response: Screenshot[];
       if (search.trim()) {
-        let embedding: number[] = [];
-        try { embedding = await requestEmbedding(search); }
-        catch { setNotice("Showing text matches while local meaning search prepares."); }
-        response = await invoke<Screenshot[]>("search_screenshots", { query: search, embedding });
+        const [meaning, visual] = await Promise.allSettled([
+          requestEmbedding(search),
+          requestVector(visualWorkerRef.current, { type: "visual-query", text: search }),
+        ]);
+        const embedding = meaning.status === "fulfilled" ? meaning.value : [];
+        const imageQueryEmbedding = visual.status === "fulfilled" ? visual.value : [];
+        if (meaning.status === "rejected") setNotice("Showing text matches while local meaning search prepares.");
+        response = await invoke<Screenshot[]>("search_screenshots", { query: search, embedding, imageQueryEmbedding });
       } else {
         response = await invoke<Screenshot[]>("list_screenshots");
       }
@@ -292,28 +306,34 @@ function LibraryApp() {
       setError(String(cause));
       return [];
     }
-  }, [requestEmbedding]);
+  }, [requestEmbedding, requestVector]);
 
   useEffect(() => {
-    const worker = new Worker(new URL("./ocr.worker.ts", import.meta.url), { type: "module" });
+    const connectWorker = (label: string) => {
+      const worker = new Worker(new URL("./ocr.worker.ts", import.meta.url), { type: "module" });
+      worker.onmessage = (event: MessageEvent<OcrMessage>) => {
+        const message = event.data;
+        if (message.type === "progress") {
+          setOcrProgress(message.progress);
+          return;
+        }
+        const resolve = pendingJobs.current.get(message.id);
+        pendingJobs.current.delete(message.id);
+        if (message.type === "result") resolve?.({ text: message.text, embedding: message.embedding, semanticError: message.semanticError });
+        else if (message.type === "embedding") resolve?.({ embedding: message.embedding });
+        else resolve?.({ error: message.error });
+      };
+      worker.onerror = (event) => {
+        setError(`${label} failed: ${event.message}`);
+        for (const resolve of pendingJobs.current.values()) resolve({ error: event.message });
+        pendingJobs.current.clear();
+      };
+      return worker;
+    };
+    const worker = connectWorker("Local OCR worker");
+    const visualWorker = connectWorker("Local visual search worker");
     workerRef.current = worker;
-    worker.onmessage = (event: MessageEvent<OcrMessage>) => {
-      const message = event.data;
-      if (message.type === "progress") {
-        setOcrProgress(message.progress);
-        return;
-      }
-      const resolve = pendingJobs.current.get(message.id);
-      pendingJobs.current.delete(message.id);
-      if (message.type === "result") resolve?.({ text: message.text, embedding: message.embedding, semanticError: message.semanticError });
-      else if (message.type === "embedding") resolve?.({ embedding: message.embedding });
-      else resolve?.({ error: message.error });
-    };
-    worker.onerror = (event) => {
-      setError(`Local OCR worker failed: ${event.message}`);
-      for (const resolve of pendingJobs.current.values()) resolve({ error: event.message });
-      pendingJobs.current.clear();
-    };
+    visualWorkerRef.current = visualWorker;
 
     let cancelled = false;
     void (async () => {
@@ -341,6 +361,7 @@ function LibraryApp() {
           const current = await invoke<Screenshot[]>("list_screenshots");
           setItems(current);
           if (sync.imported > 0) setNotice(`${sync.imported} new screenshot${sync.imported === 1 ? "" : "s"} imported from monitored folders.`);
+          else if (sync.removed > 0) setNotice(`${sync.removed} screenshot${sync.removed === 1 ? "" : "s"} removed because the original was deleted.`);
           if (sync.failed > 0) setError(`${sync.failed} screenshot${sync.failed === 1 ? " needs" : "s need"} attention during automatic import.`);
         }
       } catch (cause) {
@@ -353,7 +374,9 @@ function LibraryApp() {
     return () => {
       cancelled = true;
       worker.terminate();
+      visualWorker.terminate();
       workerRef.current = null;
+      visualWorkerRef.current = null;
       pendingJobs.current.clear();
     };
   }, []);
@@ -440,11 +463,52 @@ function LibraryApp() {
     if (!loading) void runSemanticBackfill();
   }, [loading, runSemanticBackfill]);
 
+  const runVisualBackfill = useCallback(async () => {
+    if (visualBackfillRunning.current) {
+      visualBackfillRequested.current = true;
+      return;
+    }
+    visualBackfillRunning.current = true;
+    let complete = 0;
+    try {
+      do {
+        visualBackfillRequested.current = false;
+        for (;;) {
+          const batch = await invoke<{ id: number; image_data_url: string }[]>("get_unembedded_images", {
+            exclude: [...visualBackfillFailed.current],
+          });
+          if (!batch.length) break;
+          for (const item of batch) {
+            try {
+              const embedding = await requestVector(visualWorkerRef.current, { type: "image-embed", imageDataUrl: item.image_data_url });
+              await invoke("save_image_embedding", { id: item.id, embedding });
+              complete += 1;
+            } catch {
+              // Skip this image for the rest of the session so one bad file cannot stall the queue.
+              visualBackfillFailed.current.add(item.id);
+            }
+          }
+          if (complete >= 16) setNotice(`Preparing visual search · ${complete} images`);
+        }
+      } while (visualBackfillRequested.current);
+      if (complete >= 16) setNotice(null);
+    } catch (cause) {
+      setError(`Could not prepare visual search: ${String(cause)}`);
+    } finally {
+      visualBackfillRunning.current = false;
+    }
+  }, [requestVector]);
+
+  useEffect(() => {
+    if (!loading) void runVisualBackfill();
+  }, [items.length, loading, runVisualBackfill]);
+
   useEffect(() => {
     let unlistenCreated: (() => void) | undefined;
     let unlistenFailed: (() => void) | undefined;
     let unlistenImported: (() => void) | undefined;
     let unlistenImportFailed: (() => void) | undefined;
+    let unlistenRemoved: (() => void) | undefined;
     void listen<string>("capture-created", async (event) => {
       try {
         const report = await invoke<IndexReport>("index_folder", { folder: event.payload });
@@ -472,7 +536,12 @@ function LibraryApp() {
       }
     }).then((dispose) => { unlistenImported = dispose; });
     void listen<string>("folder-import-failed", (event) => setError(`Automatic import needs attention: ${event.payload}`)).then((dispose) => { unlistenImportFailed = dispose; });
-    return () => { unlistenCreated?.(); unlistenFailed?.(); unlistenImported?.(); unlistenImportFailed?.(); };
+    void listen<string>("library-items-removed", async (event) => {
+      const removedCount = Number.parseInt(event.payload, 10) || 1;
+      await refresh(query);
+      setNotice(`${removedCount} screenshot${removedCount === 1 ? "" : "s"} removed because the original was deleted.`);
+    }).then((dispose) => { unlistenRemoved = dispose; });
+    return () => { unlistenCreated?.(); unlistenFailed?.(); unlistenImported?.(); unlistenImportFailed?.(); unlistenRemoved?.(); };
   }, [query, refresh, runOcr]);
 
   const selectLibrary = async () => {

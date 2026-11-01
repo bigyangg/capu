@@ -20,6 +20,9 @@ public/tessdata/
 public/ocr-notices/
 public/onnxruntime/
 
+# Downloaded and verified by scripts/fetch-vision-model.mjs before dev/build
+public/models/Xenova/clip-vit-base-patch32/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
