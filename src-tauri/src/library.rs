@@ -697,7 +697,7 @@ pub async fn get_ocr_image(state: State<'_, AppState>, id: i64) -> Result<String
     .map_err(|error| format!("Image read task failed: {error}"))?
 }
 
-fn screenshot_path_for_id(db_path: &Path, id: i64) -> Result<PathBuf, String> {
+pub(crate) fn screenshot_path_for_id(db_path: &Path, id: i64) -> Result<PathBuf, String> {
     let conn = connection(db_path)?;
     let path: String = conn
         .query_row("SELECT path FROM screenshots WHERE id = ?1", [id], |row| {

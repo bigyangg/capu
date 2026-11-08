@@ -34,6 +34,21 @@ xcap = "0.9"
 mouse_position = "0.1.4"
 notify = "8.2.0"
 
+# Native OCR: Windows.Media.Ocr on Windows, Apple Vision on macOS. Both run on the device.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Foundation_Collections",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+    "Win32_System_Com",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-vision = "0.3"
+
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { IdleWorker } from "./modelWorkers";
+import { IdleWorker, type WorkerResult } from "./modelWorkers";
 import { listen } from "@tauri-apps/api/event";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
@@ -470,8 +470,23 @@ function LibraryApp() {
       setNotice(`Reading text ${complete + 1} of ${queue.length} - ${screenshot.file_name}`);
       setOcrProgress(queue.length ? complete / queue.length : 0);
       try {
-        const imageDataUrl = await invoke<string>("get_ocr_image", { id: screenshot.id });
-        const result = await worker.run({ type: "ocr", imageDataUrl });
+        // The system's own OCR (Windows or macOS) is used when available; it runs in Rust and
+        // frees its memory after each image. Tesseract in the worker is the fallback.
+        const nativeText = await invoke<string | null>("recognize_text", { id: screenshot.id }).catch(() => null);
+        let result: WorkerResult;
+        if (nativeText !== null) {
+          result = { text: nativeText };
+          if (nativeText.trim()) {
+            try {
+              result.embedding = await worker.vector({ type: "embed", text: nativeText });
+            } catch (cause) {
+              result.semanticError = String(cause);
+            }
+          }
+        } else {
+          const imageDataUrl = await invoke<string>("get_ocr_image", { id: screenshot.id });
+          result = await worker.run({ type: "ocr", imageDataUrl });
+        }
         if (result.error) throw new Error(result.error);
         const text = result.text ?? "";
         await invoke("save_ocr_text", { id: screenshot.id, text, embedding: result.embedding ?? null });

@@ -1,6 +1,7 @@
 mod capture;
 mod folder_watch;
 mod library;
+mod ocr;
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
@@ -657,6 +658,7 @@ pub fn run() {
             library::save_screenshot_copy,
             library::open_screenshot,
             library::get_storage_usage,
+            ocr::recognize_text,
             library::get_monitored_folder_status,
             library::remove_missing_screenshot,
             library::save_ocr_text,
