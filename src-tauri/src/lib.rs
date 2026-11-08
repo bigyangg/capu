@@ -62,6 +62,7 @@ async fn add_monitored_folder(
             &thumbnail_dir,
             &capture_dir,
             std::slice::from_ref(&selected),
+            library::ChangeCheck::Quick,
         );
         report.monitored_folders = library::monitored_folders_from_db(&db_path)?;
         Ok(report)
@@ -94,10 +95,18 @@ async fn remove_monitored_folder(
     .map_err(|error| format!("Could not remove folder monitor: {error}"))?
 }
 
+/// Imports new and changed screenshots from every watched folder. With `full`, every file
+/// is read and compared, which also finds edits that kept the same size and modified time.
 #[tauri::command]
 async fn sync_monitored_folders(
     state: tauri::State<'_, AppState>,
+    full: Option<bool>,
 ) -> Result<library::ImportSummary, String> {
+    let check = if full.unwrap_or(false) {
+        library::ChangeCheck::Full
+    } else {
+        library::ChangeCheck::Quick
+    };
     let db_path = state.db_path.clone();
     let thumbnail_dir = state.thumbnail_dir.clone();
     let capture_dir = state.capture_dir.clone();
@@ -112,8 +121,13 @@ async fn sync_monitored_folders(
             .filter_map(|path| std::fs::canonicalize(path).ok())
             .filter(|path| path.is_dir())
             .collect::<Vec<_>>();
-        let mut report =
-            library::import_monitored_folders(&db_path, &thumbnail_dir, &capture_dir, &roots);
+        let mut report = library::import_monitored_folders(
+            &db_path,
+            &thumbnail_dir,
+            &capture_dir,
+            &roots,
+            check,
+        );
         report.monitored_folders = configured;
         Ok(report)
     })
@@ -479,6 +493,7 @@ pub fn run() {
                     &startup_thumbnails,
                     &startup_captures,
                     &roots,
+                    library::ChangeCheck::Quick,
                 );
                 if report.imported > 0 || report.moved > 0 || converted > 0 {
                     let _ = startup_app.emit("library-changed", report.imported.to_string());
@@ -606,6 +621,8 @@ pub fn run() {
             library::save_screenshot_copy,
             library::open_screenshot,
             library::get_storage_usage,
+            library::get_monitored_folder_status,
+            library::remove_missing_screenshot,
             library::save_ocr_text,
             library::save_semantic_embedding,
             library::get_unembedded_texts,

@@ -38,7 +38,7 @@ type Screenshot = {
   file_name: string;
   captured_at: number;
   file_size: number;
-  status: "pending" | "indexed" | "error" | "missing" | string;
+  status: "pending" | "indexed" | "error" | "missing" | "unavailable" | string;
   ocr_text: string;
   last_error: string | null;
   thumbnail_data_url: string | null;
@@ -57,6 +57,15 @@ type IndexReport = {
   failed: number;
   screenshots: Screenshot[];
 };
+
+type FolderStatus = { path: string; available: boolean };
+
+// "missing": the original's folder is there but the file is not.
+// "unavailable": the folder cannot be reached, usually a disconnected drive; the entry
+// returns to normal when it is reconnected.
+function originalReachable(item: Screenshot) {
+  return item.status !== "missing" && item.status !== "unavailable";
+}
 
 type StorageUsage = {
   library_files: number;
@@ -339,6 +348,8 @@ function LibraryApp() {
   const [notice, setNotice] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [storage, setStorage] = useState<StorageUsage | null>(null);
+  const [folderStatus, setFolderStatus] = useState<Record<string, boolean>>({});
+  const [recheckBusy, setRecheckBusy] = useState(false);
   const [captureMode, setCaptureMode] = useState<"active" | "all">("active");
   const [autostart, setAutostart] = useState(false);
   const [captureStatus, setCaptureStatus] = useState<string | null>(null);
@@ -683,11 +694,50 @@ function LibraryApp() {
   useEffect(() => {
     if (!settingsOpen) return;
     let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const loadFolderStatus = () => void invoke<FolderStatus[]>("get_monitored_folder_status")
+      .then((statuses) => { if (!cancelled) setFolderStatus(Object.fromEntries(statuses.map((item) => [item.path, item.available]))); })
+      .catch(() => undefined);
     void invoke<StorageUsage>("get_storage_usage")
       .then((usage) => { if (!cancelled) setStorage(usage); })
       .catch((cause) => { if (!cancelled) setError(`Could not check storage: ${String(cause)}`); });
-    return () => { cancelled = true; };
+    loadFolderStatus();
+    void listen("monitored-folders-changed", loadFolderStatus).then((dispose) => {
+      if (cancelled) dispose();
+      else unlisten = dispose;
+    });
+    return () => { cancelled = true; unlisten?.(); };
   }, [settingsOpen]);
+
+  const recheckAllFiles = async () => {
+    setRecheckBusy(true);
+    setError(null);
+    try {
+      const report = await invoke<ImportSummary>("sync_monitored_folders", { full: true });
+      const current = await invoke<Screenshot[]>("list_screenshots");
+      setItems(current);
+      setNotice(report.imported > 0
+        ? `${report.imported} new or changed screenshot${report.imported === 1 ? "" : "s"} found.`
+        : "All watched screenshots are up to date.");
+      setStorage(await invoke<StorageUsage>("get_storage_usage"));
+      void runOcr(current);
+    } catch (cause) {
+      setError(`Could not re-check files: ${String(cause)}`);
+    } finally {
+      setRecheckBusy(false);
+    }
+  };
+
+  const removeMissingScreenshot = async (item: Screenshot) => {
+    try {
+      await invoke("remove_missing_screenshot", { id: item.id });
+      setItems((current) => current.filter((entry) => entry.id !== item.id));
+      setSelected((current) => current?.id === item.id ? null : current);
+      setNotice("Removed from your library.");
+    } catch (cause) {
+      setError(String(cause));
+    }
+  };
 
   const updateShortcuts = async (fullScreen: string, region: string) => {
     setShortcutBusy(true);
@@ -1028,14 +1078,14 @@ function LibraryApp() {
               {visibleItems.map((item) => <article className={`capture-card ${selected?.id === item.id ? "selected-card" : ""}`} key={item.id}>
                 <button className="capture-thumb" onClick={() => setSelected(item)} aria-label={`Preview ${item.file_name}`} title={item.file_name}>
                   {item.thumbnail_data_url ? <img src={item.thumbnail_data_url} alt="" loading="lazy" /> : <span className="capture-thumb-fallback"><FileImage size={28} /></span>}
-                  {item.status !== "indexed" && <span className={`capture-status ${item.status}`} role="status">{item.status === "pending" ? <><LoaderCircle size={11} className="spin" /> Indexing</> : item.status === "missing" ? <><AlertCircle size={11} /> Missing</> : <><AlertCircle size={11} /> Needs attention</>}</span>}
+                  {item.status !== "indexed" && <span className={`capture-status ${item.status}`} role="status">{item.status === "pending" ? <><LoaderCircle size={11} className="spin" /> Indexing</> : item.status === "missing" ? <><AlertCircle size={11} /> Missing</> : item.status === "unavailable" ? <><AlertCircle size={11} /> Folder offline</> : <><AlertCircle size={11} /> Needs attention</>}</span>}
                   <span className="capture-hover-hint">Quick Look</span>
                 </button>
                 <div className="capture-card-body">
                   <button className="capture-file-name" onClick={() => setSelected(item)} title={item.file_name}>{item.file_name}</button>
                   <div className="capture-file-meta"><span>{prettyDate(item.captured_at)}</span><i /><span>{formatBytes(item.file_size)}</span></div>
                   {(item.subcategory ?? item.category) && <span className="capture-category">{item.subcategory ?? item.category}</span>}
-                  <div className="capture-card-actions"><button className="capture-open-original" onClick={() => void openScreenshot(item)} disabled={item.status === "missing"} title="Open original screenshot" aria-label={`Open original ${item.file_name}`}><ArrowUpRight size={15} /></button></div>
+                  <div className="capture-card-actions"><button className="capture-open-original" onClick={() => void openScreenshot(item)} disabled={!originalReachable(item)} title="Open original screenshot" aria-label={`Open original ${item.file_name}`}><ArrowUpRight size={15} /></button></div>
                 </div>
               </article>)}
             </div>
@@ -1049,11 +1099,12 @@ function LibraryApp() {
                     {item.ocr_text && <span className="ocr-snippet">{item.ocr_text.slice(0, 125).replace(/\s+/g, " ")}</span>}
                     {item.status === "error" && <em className="file-warning"><AlertCircle size={12} /> Text indexing failed</em>}
                     {item.status === "missing" && <em className="file-warning"><AlertCircle size={12} /> Original file is missing</em>}
+                    {item.status === "unavailable" && <em className="file-warning"><AlertCircle size={12} /> Original's folder isn't connected</em>}
                     {item.status === "pending" && <em><LoaderCircle size={12} className="spin" /> Waiting for on-device text recognition</em>}
                   </span>
                 </button>
                 <div className="file-row-actions">
-                  <button className="file-action" onClick={() => void openScreenshot(item)} disabled={item.status === "missing"}><ArrowUpRight size={14} /> Open original</button>
+                  <button className="file-action" onClick={() => void openScreenshot(item)} disabled={!originalReachable(item)}><ArrowUpRight size={14} /> Open original</button>
                   {item.status === "error" && <button className="file-action retry-action" onClick={() => void retryIndexing(item)}><RotateCw size={13} /> Retry scan</button>}
                 </div>
               </article>)}
@@ -1070,21 +1121,21 @@ function LibraryApp() {
           <div className="detail-image">{detailImage ? <img src={detailImage} alt={`Preview of ${selected.file_name}`} /> : detailImageBusy ? <LoaderCircle size={25} className="spin" aria-label="Loading full resolution preview" /> : <FileImage size={34} />}{detailImageError && <span className="detail-image-error">{detailImageError}</span>}</div>
           <div className="detail-toolbar">
             <div className="detail-image-actions">
-            <button className={`button secondary-button ${shareFeedback === "copy" ? "action-success" : ""}`} onClick={() => void copyScreenshotImage(selected)} disabled={shareAction !== null || selected.status === "missing"} title="Copy the full-resolution image to the clipboard">
+            <button className={`button secondary-button ${shareFeedback === "copy" ? "action-success" : ""}`} onClick={() => void copyScreenshotImage(selected)} disabled={shareAction !== null || !originalReachable(selected)} title="Copy the full-resolution image to the clipboard">
               {shareAction === "copy" ? <LoaderCircle size={14} className="spin" /> : shareFeedback === "copy" ? <Check size={14} /> : <Copy size={14} />}{shareAction === "copy" ? "Copying..." : shareFeedback === "copy" ? "Copied" : "Copy image"}
             </button>
-            <button className={`button secondary-button ${shareFeedback === "save" ? "action-success" : ""}`} onClick={() => void saveScreenshotCopy(selected)} disabled={shareAction !== null || selected.status === "missing"} title="Save a copy of the original image">
+            <button className={`button secondary-button ${shareFeedback === "save" ? "action-success" : ""}`} onClick={() => void saveScreenshotCopy(selected)} disabled={shareAction !== null || !originalReachable(selected)} title="Save a copy of the original image">
               {shareAction === "save" ? <LoaderCircle size={14} className="spin" /> : shareFeedback === "save" ? <Check size={14} /> : <Download size={14} />}{shareAction === "save" ? "Saving..." : shareFeedback === "save" ? "Saved" : "Save a copy"}
             </button>
             </div>
             <div className="detail-preview-nav"><button className="text-button" disabled={visibleItems.length < 2} onClick={() => { const index = visibleItems.findIndex((item) => item.id === selected.id); setSelected(visibleItems[(index - 1 + visibleItems.length) % visibleItems.length]); }} aria-label="Previous screenshot"><ChevronLeft size={15} /></button><span>{Math.max(visibleItems.findIndex((item) => item.id === selected.id) + 1, 1)} <i>/</i> {visibleItems.length}</span><button className="text-button" disabled={visibleItems.length < 2} onClick={() => { const index = visibleItems.findIndex((item) => item.id === selected.id); setSelected(visibleItems[(index + 1) % visibleItems.length]); }} aria-label="Next screenshot"><ChevronRight size={15} /></button></div>
           </div>
-          <div className="detail-meta"><div><span>Captured</span><strong>{prettyDate(selected.captured_at)}</strong></div><div><span>File size</span><strong>{formatBytes(selected.file_size)}</strong></div><div><span>Index status</span><strong className={`detail-status ${selected.status}`}>{selected.status === "indexed" ? "Text searchable" : selected.status === "pending" ? "Waiting for OCR" : selected.status === "missing" ? "Original missing" : "Needs retry"}</strong></div></div>
+          <div className="detail-meta"><div><span>Captured</span><strong>{prettyDate(selected.captured_at)}</strong></div><div><span>File size</span><strong>{formatBytes(selected.file_size)}</strong></div><div><span>Index status</span><strong className={`detail-status ${selected.status}`}>{selected.status === "indexed" ? "Text searchable" : selected.status === "pending" ? "Waiting for OCR" : selected.status === "missing" ? "Original missing" : selected.status === "unavailable" ? "Folder not connected" : "Needs retry"}</strong></div></div>
           <div className="detail-category"><span>CATEGORY</span><CategoryPicker screenshot={selected} onChange={(screenshot, category) => void updateCategory(screenshot, category)} /></div>
           {selected.ocr_text && <details className="detail-ocr"><summary><span>Recognized text</span><ChevronDown size={15} /></summary><div className="detail-ocr-content"><p>{selected.ocr_text}</p><button className="text-button" onClick={() => void navigator.clipboard.writeText(selected.ocr_text)}>Copy text</button></div></details>}
           {selected.last_error && <div className="detail-error"><AlertCircle size={15} /><span>{selected.last_error}</span></div>}
           <div className="detail-location"><Folder size={15} /><span>{selected.path}</span></div>
-          <div className="detail-actions"><button className="button primary-button" onClick={() => void openScreenshot(selected)} disabled={selected.status === "missing"}><ArrowUpRight size={15} /> Open original</button>{selected.status === "error" && <button className="button secondary-button" onClick={() => void retryIndexing(selected)}><RotateCw size={14} /> Retry indexing</button>}</div>
+          <div className="detail-actions"><button className="button primary-button" onClick={() => void openScreenshot(selected)} disabled={!originalReachable(selected)}><ArrowUpRight size={15} /> Open original</button>{selected.status === "missing" && <button className="button secondary-button" onClick={() => void removeMissingScreenshot(selected)} title="The original was deleted or moved. Remove its preview and search text."><X size={14} /> Remove from library</button>}{selected.status === "error" && <button className="button secondary-button" onClick={() => void retryIndexing(selected)}><RotateCw size={14} /> Retry indexing</button>}</div>
           <div className="detail-privacy"><ShieldCheck size={14} /> Original image is never changed by indexing.</div>
         </aside>
       </div>}
@@ -1102,6 +1153,7 @@ function LibraryApp() {
           {monitoredFolders.length > 0 ? <div className="monitored-folder-list">
             {monitoredFolders.map((path) => <div className="monitored-folder" key={path} title={path}>
               <Folder size={15} /><span>{path.split(/[\\/]/).filter(Boolean).slice(-1)[0] ?? path}</span>
+              {folderStatus[path] === false && <small className="folder-offline" title="Not reachable now. Nothing is removed; it resumes when the folder is back.">Not connected</small>}
               <button className="icon-button" onClick={() => void removeMonitoredFolder(path)} aria-label={`Stop monitoring ${path}`} title="Stop monitoring"><X size={14} /></button>
             </div>)}
           </div> : <div className="monitor-empty">No monitored folders yet.</div>}
@@ -1112,6 +1164,7 @@ function LibraryApp() {
             <div><dt>From watched folders</dt><dd>{storage.referenced_files} file{storage.referenced_files === 1 ? "" : "s"} · no extra copy</dd></div>
             <div><dt>Previews and search data</dt><dd>{formatBytes(storage.thumbnail_bytes + storage.database_bytes)}</dd></div>
           </dl> : <div className="monitor-empty">Checking storage…</div>}
+          <button className="text-button storage-recheck" onClick={() => void recheckAllFiles()} disabled={recheckBusy} title="Read every watched file again. Finds edits that kept the same size and date.">{recheckBusy ? "Re-checking…" : "Re-check all files"}</button>
         </div>
         <div className="settings-section"><h3>Full screen capture</h3><p>Choose which display {fullScreenLabel ?? "the full-screen shortcut"} captures.</p>
           <label className="setting-choice"><input type="radio" name="capture-mode" checked={captureMode === "active"} onChange={() => { setCaptureMode("active"); void invoke("set_capture_display_mode", { mode: "active" }).catch((cause) => setError(String(cause))); }} /><span><strong>Active display</strong><small>Capture the display under your pointer.</small></span></label>

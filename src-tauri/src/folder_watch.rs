@@ -8,9 +8,53 @@ use std::{
 };
 use tauri::{AppHandle, Emitter};
 
+/// How often configured folders are checked for coming back (a drive reconnected or
+/// access restored) or going away.
+const ROOT_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+
 pub struct FolderWatchService {
-    watcher: RecommendedWatcher,
+    watcher: Arc<Mutex<RecommendedWatcher>>,
     roots: Arc<Mutex<Vec<PathBuf>>>,
+}
+
+/// Forgets watches on folders that disappeared and watches configured folders that are
+/// available again. Returns the folders that came back, which need a sync to catch up on
+/// what changed while they were away. Locks `roots` before `watcher`, like `add`.
+fn refresh_roots(
+    db_path: &Path,
+    roots: &Mutex<Vec<PathBuf>>,
+    watcher: &Mutex<RecommendedWatcher>,
+) -> Vec<PathBuf> {
+    let Ok(configured) = library::monitored_folders_from_db(db_path) else {
+        return Vec::new();
+    };
+    let Ok(mut roots) = roots.lock() else {
+        return Vec::new();
+    };
+    let Ok(mut watcher) = watcher.lock() else {
+        return Vec::new();
+    };
+    roots.retain(|root| {
+        let available = root.is_dir();
+        if !available {
+            let _ = watcher.unwatch(root);
+        }
+        available
+    });
+    let mut returned = Vec::new();
+    for folder in configured {
+        let Ok(root) = std::fs::canonicalize(&folder) else {
+            continue;
+        };
+        if !root.is_dir() || roots.contains(&root) {
+            continue;
+        }
+        if watcher.watch(&root, RecursiveMode::Recursive).is_ok() {
+            roots.push(root.clone());
+            returned.push(root);
+        }
+    }
+    returned
 }
 
 impl FolderWatchService {
@@ -46,11 +90,14 @@ impl FolderWatchService {
             }
         }
         let roots = Arc::new(Mutex::new(active_roots));
+        let watcher = Arc::new(Mutex::new(watcher));
         let event_roots = Arc::clone(&roots);
+        let event_watcher = Arc::clone(&watcher);
         std::thread::Builder::new()
             .name("screenshot-folder-importer".into())
             .spawn(move || {
                 let mut pending: HashMap<PathBuf, (Instant, u8)> = HashMap::new();
+                let mut last_root_check = Instant::now();
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(250)) {
                         Ok(path) => {
@@ -138,6 +185,29 @@ impl FolderWatchService {
                     if let Some(error) = first_failure {
                         let _ = app.emit("folder-import-failed", error);
                     }
+                    if last_root_check.elapsed() >= ROOT_CHECK_INTERVAL {
+                        last_root_check = Instant::now();
+                        let returned = refresh_roots(&db_path, &event_roots, &event_watcher);
+                        if !returned.is_empty()
+                            && let Ok(_guard) = import_lock.lock()
+                        {
+                            let report = library::import_monitored_folders(
+                                &db_path,
+                                &thumbnail_dir,
+                                &capture_dir,
+                                &returned,
+                                library::ChangeCheck::Quick,
+                            );
+                            if report.imported > 0 || report.moved > 0 {
+                                let _ = app.emit("library-changed", report.imported.to_string());
+                            }
+                            if report.removed > 0 {
+                                let _ =
+                                    app.emit("library-items-removed", report.removed.to_string());
+                            }
+                        }
+                        let _ = app.emit("monitored-folders-changed", ());
+                    }
                 }
             })
             .map_err(|error| format!("Could not start folder import queue: {error}"))?;
@@ -159,6 +229,8 @@ impl FolderWatchService {
             return Ok(canonical);
         }
         self.watcher
+            .lock()
+            .map_err(|_| "Folder monitor is unavailable.".to_string())?
             .watch(&canonical, RecursiveMode::Recursive)
             .map_err(|error| format!("Could not monitor that folder: {error}"))?;
         roots.push(canonical.clone());
@@ -172,6 +244,8 @@ impl FolderWatchService {
             .map_err(|_| "Folder monitor is unavailable.".to_string())?;
         if roots.iter().any(|root| root == folder) {
             self.watcher
+                .lock()
+                .map_err(|_| "Folder monitor is unavailable.".to_string())?
                 .unwatch(folder)
                 .map_err(|error| format!("Could not stop monitoring that folder: {error}"))?;
             roots.retain(|root| root != folder);

@@ -4,6 +4,7 @@ use image::ImageFormat;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
@@ -145,7 +146,7 @@ pub fn initialize_database(path: &Path) -> Result<(), String> {
         ("suggested_subcategory", "TEXT"),
         ("category_is_manual", "INTEGER NOT NULL DEFAULT 0"),
         ("source_path", "TEXT"),
-        ("file_modified_ms", "INTEGER"),
+        ("file_change_stamp", "INTEGER"),
     ] {
         let exists: bool = conn
             .query_row(
@@ -1103,6 +1104,7 @@ pub fn import_monitored_file(
     capture_dir: &Path,
     monitored_roots: &[PathBuf],
     source: &Path,
+    check: ChangeCheck,
 ) -> Result<ImportOutcome, String> {
     if !is_supported_image(source) {
         return Ok(ImportOutcome::Skipped);
@@ -1129,19 +1131,21 @@ pub fn import_monitored_file(
 
     let conn = connection(db_path)?;
     let source_text = source.to_string_lossy().into_owned();
-    // A file already in the library with the same size and modified time has not changed,
-    // so it is skipped without reading it again.
-    let metadata = fs::metadata(&source).map_err(|error| error.to_string())?;
-    let unchanged: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM screenshots WHERE path=?1 AND file_size=?2
-             AND file_modified_ms=?3 AND file_hash IS NOT NULL)",
-            params![source_text, metadata.len(), modified_ms(&metadata)],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
-    if unchanged {
-        return Ok(ImportOutcome::Skipped);
+    // A file already in the library with the same size and change stamp has not changed,
+    // so a folder sync skips it without reading it again.
+    if check == ChangeCheck::Quick {
+        let metadata = fs::metadata(&source).map_err(|error| error.to_string())?;
+        let unchanged: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM screenshots WHERE path=?1 AND file_size=?2
+                 AND file_change_stamp=?3 AND file_hash IS NOT NULL)",
+                params![source_text, metadata.len(), change_stamp(&metadata)],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if unchanged {
+            return Ok(ImportOutcome::Skipped);
+        }
     }
 
     let stable = wait_for_import_stable(&source)?;
@@ -1223,6 +1227,7 @@ pub fn import_monitored_event(
                 capture_dir,
                 monitored_roots,
                 &path,
+                ChangeCheck::Full,
             )?);
         }
     } else {
@@ -1232,6 +1237,7 @@ pub fn import_monitored_event(
             capture_dir,
             monitored_roots,
             event_path,
+            ChangeCheck::Full,
         )?);
     }
     Ok(changes)
@@ -1309,8 +1315,8 @@ pub fn convert_imports_to_references(
                 .and_then(|name| name.to_str())
                 .unwrap_or("Screenshot");
             conn.execute(
-                "UPDATE screenshots SET path=?1,file_name=?2,file_modified_ms=?3 WHERE id=?4",
-                params![source, file_name, modified_ms(&metadata), id],
+                "UPDATE screenshots SET path=?1,file_name=?2,file_change_stamp=?3 WHERE id=?4",
+                params![source, file_name, change_stamp(&metadata), id],
             )
             .map_err(|error| error.to_string())?;
             let _ = fs::remove_file(&path);
@@ -1381,6 +1387,71 @@ pub async fn get_storage_usage(state: State<'_, AppState>) -> Result<StorageUsag
     .map_err(|error| format!("Storage check failed: {error}"))?
 }
 
+#[derive(Serialize)]
+pub struct FolderStatus {
+    path: String,
+    available: bool,
+}
+
+/// Whether each watched folder can be reached now. An unavailable folder (a disconnected
+/// drive, a share that is offline, or access removed) is picked up again automatically
+/// once it returns, and nothing is removed from the library while it is away.
+#[tauri::command]
+pub async fn get_monitored_folder_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<FolderStatus>, String> {
+    let db_path = state.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(monitored_folders_from_db(&db_path)?
+            .into_iter()
+            .map(|path| FolderStatus {
+                available: fs::read_dir(&path).is_ok(),
+                path,
+            })
+            .collect())
+    })
+    .await
+    .map_err(|error| format!("Folder check failed: {error}"))?
+}
+
+/// Removes a screenshot whose original no longer exists. It refuses while the original is
+/// still there or its folder cannot be reached, so a disconnected drive never loses entries.
+#[tauri::command]
+pub async fn remove_missing_screenshot(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let db_path = state.db_path.clone();
+    let thumbnail_dir = state.thumbnail_dir.clone();
+    let capture_dir = state.capture_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = connection(&db_path)?;
+        let (path, thumbnail): (String, Option<String>) = conn
+            .query_row(
+                "SELECT path,thumbnail_path FROM screenshots WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| "That screenshot is no longer in the library.".to_string())?;
+        let original = Path::new(&path);
+        if !source_is_gone(original) {
+            return Err("The original file is still there.".into());
+        }
+        if !original.parent().is_some_and(Path::is_dir) {
+            return Err(
+                "The original's folder isn't available. Reconnect the drive and try again.".into(),
+            );
+        }
+        delete_library_item(
+            &conn,
+            &thumbnail_dir,
+            &capture_dir,
+            id,
+            &path,
+            thumbnail.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| format!("Remove task failed: {error}"))?
+}
+
 /// Opens a library screenshot in the system's default image viewer. The path comes from
 /// the library, not from the web view.
 #[tauri::command]
@@ -1404,13 +1475,36 @@ fn shell_path(path: &Path) -> PathBuf {
     }
 }
 
-fn modified_ms(metadata: &fs::Metadata) -> i64 {
-    metadata
+/// A time in milliseconds that changes whenever the file's contents change. On macOS and
+/// Linux this includes the inode change time, which programs cannot set back, so an edit is
+/// noticed even when the editor restores the modified time. The Rust standard library does
+/// not expose the equivalent NTFS time on Windows, so there the last-write time is used and
+/// watcher events and "Re-check all files" read the file in full instead.
+fn change_stamp(metadata: &fs::Metadata) -> i64 {
+    let modified = metadata
         .modified()
         .unwrap_or(UNIX_EPOCH)
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as i64
+        .as_millis() as i64;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let changed = metadata.ctime() * 1000 + metadata.ctime_nsec() / 1_000_000;
+        modified.max(changed)
+    }
+    #[cfg(not(unix))]
+    modified
+}
+
+/// How an import decides whether a file already in the library has changed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChangeCheck {
+    /// Skip files whose size and change stamp match the library. Used for folder syncs.
+    Quick,
+    /// Read and hash every file. Used for watcher events, which mean the file was touched,
+    /// and for "Re-check all files".
+    Full,
 }
 
 fn wait_for_import_stable(path: &Path) -> Result<(u64, SystemTime), String> {
@@ -1459,7 +1553,18 @@ fn is_online_only(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(windows))]
+/// True for an iCloud Drive file whose contents were removed from this Mac to save space
+/// ("dataless"). Reading it downloads it.
+#[cfg(target_os = "macos")]
+fn is_online_only(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000;
+    fs::metadata(path)
+        .map(|metadata| metadata.st_flags() & SF_DATALESS != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn is_online_only(_path: &Path) -> bool {
     false
 }
@@ -1617,6 +1722,7 @@ pub fn import_monitored_folders(
     thumbnail_dir: &Path,
     capture_dir: &Path,
     roots: &[PathBuf],
+    check: ChangeCheck,
 ) -> ImportSummary {
     let mut summary = ImportSummary {
         imported: 0,
@@ -1636,7 +1742,7 @@ pub fn import_monitored_folders(
             continue;
         }
         for path in paths {
-            match import_monitored_file(db_path, thumbnail_dir, capture_dir, roots, &path) {
+            match import_monitored_file(db_path, thumbnail_dir, capture_dir, roots, &path, check) {
                 Ok(ImportOutcome::Imported) => summary.imported += 1,
                 Ok(ImportOutcome::Moved) => summary.moved += 1,
                 Ok(ImportOutcome::Duplicate) => summary.duplicates += 1,
@@ -1657,12 +1763,16 @@ pub fn import_monitored_folders(
 fn walk_directory(path: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries =
         fs::read_dir(path).map_err(|error| format!("Cannot scan {}: {error}", path.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| error.to_string())?;
-        let kind = entry.file_type().map_err(|error| error.to_string())?;
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         let entry_path = entry.path();
         if kind.is_dir() {
-            walk_directory(&entry_path, found)?;
+            // A subfolder that cannot be read (for example, access denied) is skipped so
+            // the rest of the folder still imports. Its entries are kept: an unreadable file
+            // is not treated as deleted.
+            let _ = walk_directory(&entry_path, found);
         } else if kind.is_file() {
             let supported = entry_path
                 .extension()
@@ -1702,10 +1812,9 @@ fn index_file(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let modified_ms = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    let change_stamp = fs::metadata(path)
+        .map(|metadata| change_stamp(&metadata))
+        .unwrap_or_default();
 
     let existing: Option<(i64, u64, Option<String>, String, Option<String>)> = conn
         .query_row(
@@ -1722,8 +1831,8 @@ fn index_file(
         && status != "error"
     {
         conn.execute(
-            "UPDATE screenshots SET file_modified_ms=?1 WHERE id=?2",
-            params![modified_ms, id],
+            "UPDATE screenshots SET file_change_stamp=?1 WHERE id=?2",
+            params![change_stamp, id],
         )
         .map_err(|error| error.to_string())?;
         return Ok(ScanOutcome::Skipped);
@@ -1774,14 +1883,14 @@ fn index_file(
             conn.execute(
                 "UPDATE screenshots SET file_hash=?1, file_name=?2, captured_at=?3, file_size=?4,
                  status='pending', ocr_text='', last_error=NULL, thumbnail_path=?5,
-                 file_modified_ms=?6 WHERE id=?7",
+                 file_change_stamp=?6 WHERE id=?7",
                 params![
                     hash,
                     file_name,
                     captured_at,
                     size,
                     thumb_text,
-                    modified_ms,
+                    change_stamp,
                     id
                 ],
             )
@@ -1814,9 +1923,9 @@ fn index_file(
         }
         None => {
             conn.execute(
-                "INSERT INTO screenshots(path,file_hash,file_name,captured_at,file_size,status,thumbnail_path,file_modified_ms)
+                "INSERT INTO screenshots(path,file_hash,file_name,captured_at,file_size,status,thumbnail_path,file_change_stamp)
                  VALUES(?1,?2,?3,?4,?5,'pending',?6,?7)",
-                params![path_text, hash, file_name, captured_at, size, thumb_text, modified_ms],
+                params![path_text, hash, file_name, captured_at, size, thumb_text, change_stamp],
             ).map_err(|error| error.to_string())?;
         }
     }
@@ -1917,8 +2026,10 @@ fn load_screenshots(
         None => statement.query([]).map_err(|error| error.to_string())?,
     };
     let mut screenshots = Vec::new();
+    let mut folders = HashMap::new();
     while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-        screenshots.push(screenshot_from_row(row).map_err(|error| error.to_string())?);
+        screenshots
+            .push(screenshot_from_row(row, &mut folders).map_err(|error| error.to_string())?);
     }
     Ok(screenshots)
 }
@@ -1943,13 +2054,36 @@ fn load_screenshots_by_ids(
         .query(rusqlite::params_from_iter(ids.iter()))
         .map_err(|error| error.to_string())?;
     let mut screenshots = Vec::new();
+    let mut folders = HashMap::new();
     while let Some(row) = rows.next().map_err(|error| error.to_string())? {
-        screenshots.push(screenshot_from_row(row).map_err(|error| error.to_string())?);
+        screenshots
+            .push(screenshot_from_row(row, &mut folders).map_err(|error| error.to_string())?);
     }
     Ok(screenshots)
 }
 
-fn screenshot_from_row(row: &rusqlite::Row<'_>) -> Result<Screenshot, rusqlite::Error> {
+/// "unavailable" when the original's folder cannot be reached (a disconnected drive or
+/// share), "missing" when the folder is there but the file is not. Folder checks are cached
+/// per load, so an offline share is probed once per folder rather than once per file.
+fn file_status(path: &Path, stored: String, folders: &mut HashMap<PathBuf, bool>) -> String {
+    let folder_available = path.parent().is_none_or(|parent| {
+        *folders
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| parent.is_dir())
+    });
+    if !folder_available {
+        "unavailable".to_string()
+    } else if path.is_file() {
+        stored
+    } else {
+        "missing".to_string()
+    }
+}
+
+fn screenshot_from_row(
+    row: &rusqlite::Row<'_>,
+    folders: &mut HashMap<PathBuf, bool>,
+) -> Result<Screenshot, rusqlite::Error> {
     let thumbnail_path: Option<String> = row.get(8)?;
     let thumbnail_data_url = thumbnail_path
         .and_then(|path| fs::read(path).ok())
@@ -1962,11 +2096,7 @@ fn screenshot_from_row(row: &rusqlite::Row<'_>) -> Result<Screenshot, rusqlite::
         file_name: row.get(2)?,
         captured_at: row.get(3)?,
         file_size: row.get(4)?,
-        status: if Path::new(&path).is_file() {
-            stored_status
-        } else {
-            "missing".to_string()
-        },
+        status: file_status(Path::new(&path), stored_status, folders),
         ocr_text: row.get(6)?,
         last_error: row.get(7)?,
         thumbnail_data_url,
@@ -2028,12 +2158,17 @@ mod import_tests {
         }
 
         fn import(&self, source: &Path) -> ImportOutcome {
+            self.import_with(source, ChangeCheck::Quick)
+        }
+
+        fn import_with(&self, source: &Path, check: ChangeCheck) -> ImportOutcome {
             import_monitored_file(
                 &self.db,
                 &self.thumbnails,
                 &self.captures,
                 std::slice::from_ref(&self.watched),
                 source,
+                check,
             )
             .unwrap()
         }
@@ -2138,6 +2273,95 @@ mod import_tests {
             fs::read_dir(&fixture.thumbnails).unwrap().count(),
             1,
             "the earlier version's thumbnail is removed"
+        );
+    }
+
+    /// An edit that keeps the same size and restores the modified time. BMP files of the
+    /// same dimensions are always the same size.
+    fn edit_keeping_size_and_time(path: &Path, shade: u8) {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let before = fs::metadata(path).unwrap().len();
+        std::thread::sleep(Duration::from_millis(20));
+        image::RgbImage::from_pixel(8, 8, image::Rgb([shade, 0, 0]))
+            .save(path)
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().len(), before);
+    }
+
+    #[test]
+    fn a_full_check_finds_an_edit_that_kept_size_and_time() {
+        let fixture = Fixture::new("hidden-edit");
+        let source = fixture.image("shot.bmp", 80);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        edit_keeping_size_and_time(&source, 90);
+        assert!(fixture.import_with(&source, ChangeCheck::Full) == ImportOutcome::Imported);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_quick_check_finds_an_edit_that_kept_size_and_time() {
+        let fixture = Fixture::new("hidden-edit-quick");
+        let source = fixture.image("shot.bmp", 80);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        edit_keeping_size_and_time(&source, 90);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+    }
+
+    #[test]
+    fn moving_an_original_out_of_watched_folders_removes_its_entry() {
+        let fixture = Fixture::new("move-out");
+        let source = fixture.image("shot.png", 85);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        let outside = fixture.root.join("outside.png");
+        fs::rename(&source, &outside).unwrap();
+        assert_eq!(fixture.remove(&source), 1);
+        assert!(fixture.rows().is_empty());
+        assert!(outside.is_file(), "the moved file itself is untouched");
+    }
+
+    #[test]
+    fn nothing_is_removed_while_the_watched_folder_is_unavailable() {
+        let fixture = Fixture::new("unavailable");
+        let source = fixture.image("shot.png", 95);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        // Simulate a disconnected drive by moving the whole watched folder away.
+        let parked = fixture.root.join("parked");
+        fs::rename(&fixture.watched, &parked).unwrap();
+        assert_eq!(fixture.remove(&source), 0);
+        let summary = import_monitored_folders(
+            &fixture.db,
+            &fixture.thumbnails,
+            &fixture.captures,
+            std::slice::from_ref(&fixture.watched),
+            ChangeCheck::Quick,
+        );
+        assert_eq!(summary.removed, 0);
+        assert_eq!(fixture.rows().len(), 1);
+
+        let mut folders = HashMap::new();
+        assert_eq!(
+            file_status(
+                Path::new(&fixture.rows()[0].0),
+                "indexed".into(),
+                &mut folders
+            ),
+            "unavailable"
+        );
+        fs::rename(&parked, &fixture.watched).unwrap();
+        let mut folders = HashMap::new();
+        assert_eq!(
+            file_status(
+                Path::new(&fixture.rows()[0].0),
+                "indexed".into(),
+                &mut folders
+            ),
+            "indexed"
         );
     }
 
