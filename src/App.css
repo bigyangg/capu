@@ -198,9 +198,6 @@ button:focus-visible, input:focus-visible { outline: 3px solid #b7d2b8; outline-
 .setting-choice small, .setting-toggle small { color: #92998f; font-size: 10px; }
 .setting-toggle { justify-content: space-between; }
 .setting-toggle input { width: 34px; height: 19px; accent-color: #4f7d50; cursor: pointer; }
-.shortcut-summary { display: grid; gap: 8px; padding: 15px; border-radius: 10px; background: #f6f8f3; color: #677163; font-size: 10px; }
-.shortcut-summary strong { color: #39443a; font-size: 11px; }
-.shortcut-summary small { color: #9a6843; line-height: 1.4; }
 
 .region-stage { position: fixed; inset: 0; overflow: hidden; background: #202420; cursor: crosshair; touch-action: none; user-select: none; }
 .region-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; pointer-events: none; }
@@ -321,8 +318,6 @@ body, .app-shell { background: #f8f2e9; }
 .settings-section > p { color: #796c5e; font-size: 13px; }
 .setting-choice strong, .setting-toggle strong { color: #493c31; font-size: 13px; }
 .setting-choice small, .setting-toggle small { color: #8b7d6b; font-size: 11px; }
-.shortcut-summary { background: #f5eee3; color: #6e5d4c; font-size: 12px; }
-.shortcut-summary strong { color: #493c31; font-size: 13px; }
 
 @media (max-width: 1200px) {
   .content-scroll { padding-right: 30px; padding-left: 30px; }
@@ -512,8 +507,6 @@ body, .app-shell { background: #f3f5f6; color: #243441; }
 .settings-heading h2 { color: #243843; }
 .settings-section h3 { color: #344953; }
 .settings-section > p { color: #718087; }
-.shortcut-summary { background: #f2f6f5; color: #5c7074; }
-.shortcut-summary strong { color: #31494b; }
 
 @media (max-width: 760px) {
   .page-heading h1 { font-size: 29px; }
@@ -872,3 +865,16 @@ body { min-width: 760px; background: #f5f6f7; }
 @media (prefers-reduced-motion: reduce) {
   .detail-image-actions .button, .detail-image-actions .button.action-success { animation: none; transition: none; }
 }
+
+/* Global shortcut editor in Settings */
+.shortcut-row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 6px 12px; padding: 9px 10px; border-radius: 8px; }
+.shortcut-row > span { color: #344953; font-size: 12px; font-weight: 600; }
+.shortcut-row small, .shortcut-status { grid-column: 1 / -1; color: #9a6843; font-size: 11px; line-height: 1.4; }
+.shortcut-status { display: block; padding: 4px 10px 0; }
+.shortcut-recorder { display: inline-flex; align-items: center; gap: 4px; min-width: 132px; min-height: 30px; justify-content: center; padding: 3px 8px; border: 1px solid #dbe3e1; border-radius: 8px; background: #fff; color: #5c7074; font: inherit; font-size: 11px; cursor: pointer; }
+.shortcut-recorder:hover:not(:disabled) { border-color: #a9c3be; }
+.shortcut-recorder:focus-visible { outline: 2px solid #73a49c; outline-offset: 2px; }
+.shortcut-recorder:disabled { cursor: progress; opacity: 0.6; }
+.shortcut-recorder.recording { border-color: #73a49c; background: #f2f6f5; color: #31494b; }
+.shortcut-recorder kbd { padding: 2px 5px; border: 1px solid #e3e9e7; border-radius: 5px; background: #f7f9f8; color: #31494b; font: inherit; font-size: 10px; }
+.shortcut-reset { margin: 6px 10px 0; }

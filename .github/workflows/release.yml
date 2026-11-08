@@ -1,0 +1,75 @@
+# Builds installers for Windows (MSI and NSIS) and macOS (universal DMG) when a version tag
+# such as v0.1.2 is pushed, and attaches them to a draft GitHub release for review.
+#
+# Signing is not configured yet, so these builds are unsigned:
+# - Windows shows an "Unknown publisher" SmartScreen warning.
+# - macOS Gatekeeper blocks the app, and Screen Recording permission does not persist
+#   across rebuilds.
+# To sign macOS builds, add these repository secrets and uncomment the matching env lines:
+# APPLE_CERTIFICATE (base64 .p12), APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+# APPLE_ID, APPLE_PASSWORD (app-specific password), APPLE_TEAM_ID.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: actions/cache@v4
+        with:
+          path: public/models/Xenova/clip-vit-base-patch32
+          key: clip-vit-base-patch32-6b7c523703ae26e39be4b03774966f8571c7f523
+
+      - run: npm ci
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_ID: ${{ secrets.APPLE_ID }}
+          # APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          # APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Screenshot Memory ${{ github.ref_name }}
+          releaseBody: Unsigned test build. macOS has not been tested end to end yet.
+          releaseDraft: true
+          prerelease: true
+          args: ${{ matrix.args }}

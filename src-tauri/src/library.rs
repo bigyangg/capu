@@ -453,35 +453,6 @@ fn suggest_category(text: &str) -> (Option<String>, Option<String>) {
     (category, subcategory)
 }
 
-#[tauri::command]
-pub fn get_library_folder(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    let conn = connection(&state.db_path)?;
-    conn.query_row(
-        "SELECT value FROM settings WHERE key = 'library_folder'",
-        [],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub fn set_library_folder(state: State<'_, AppState>, folder: String) -> Result<(), String> {
-    let selected =
-        fs::canonicalize(&folder).map_err(|error| format!("Cannot access that folder: {error}"))?;
-    if !selected.is_dir() {
-        return Err("Choose an existing folder.".to_string());
-    }
-    let conn = connection(&state.db_path)?;
-    conn.execute(
-        "INSERT INTO settings(key, value) VALUES('library_folder', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [selected.to_string_lossy().as_ref()],
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(())
-}
-
 pub fn monitored_folders_from_db(db_path: &Path) -> Result<Vec<String>, String> {
     let conn = connection(db_path)?;
     let mut statement = conn
@@ -543,14 +514,14 @@ pub async fn set_screenshot_category(
     .map_err(|error| format!("Category update failed: {error}"))?
 }
 
+/// Indexes new files in the managed capture folder. Folders chosen by the user are never
+/// indexed in place; they are imported through monitored folders instead.
 #[tauri::command]
-pub async fn index_folder(
-    state: State<'_, AppState>,
-    folder: String,
-) -> Result<IndexReport, String> {
+pub async fn index_capture_folder(state: State<'_, AppState>) -> Result<IndexReport, String> {
     let db_path = state.db_path.clone();
     let thumbnail_dir = state.thumbnail_dir.clone();
-    tauri::async_runtime::spawn_blocking(move || scan_folder(&db_path, &thumbnail_dir, &folder))
+    let capture_dir = state.capture_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || scan_folder(&db_path, &thumbnail_dir, &capture_dir))
         .await
         .map_err(|error| format!("Indexing task failed: {error}"))?
 }
@@ -1040,7 +1011,7 @@ pub fn mark_ocr_failed(state: State<'_, AppState>, id: i64, error: String) -> Re
     Ok(())
 }
 
-fn scan_folder(db_path: &Path, thumbnail_dir: &Path, folder: &str) -> Result<IndexReport, String> {
+fn scan_folder(db_path: &Path, thumbnail_dir: &Path, folder: &Path) -> Result<IndexReport, String> {
     let root =
         fs::canonicalize(folder).map_err(|error| format!("Cannot access that folder: {error}"))?;
     if !root.is_dir() {

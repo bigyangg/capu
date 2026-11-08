@@ -3,8 +3,10 @@ mod folder_watch;
 mod library;
 
 use rusqlite::{Connection, OptionalExtension};
+use serde::Serialize;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
+    str::FromStr,
     sync::{Arc, Mutex},
 };
 use tauri::{
@@ -12,7 +14,7 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
 };
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 pub struct AppState {
     pub db_path: PathBuf,
@@ -20,6 +22,7 @@ pub struct AppState {
     pub capture_dir: PathBuf,
     pub pending_region: Mutex<Option<capture::PendingRegion>>,
     pub shortcut_error: Mutex<Option<String>>,
+    pub shortcuts: Mutex<CaptureShortcuts>,
     pub folder_watcher: Arc<Mutex<folder_watch::FolderWatchService>>,
     pub import_lock: Arc<Mutex<()>>,
 }
@@ -118,7 +121,171 @@ async fn sync_monitored_folders(
     .map_err(|error| format!("Could not sync monitored folders: {error}"))?
 }
 
-fn setting(db_path: &PathBuf, key: &str) -> Result<Option<String>, String> {
+/// Global capture shortcuts as accelerator strings such as "Alt+Shift+S".
+#[derive(Clone, Serialize)]
+pub struct CaptureShortcuts {
+    pub full_screen: String,
+    pub region: String,
+}
+
+// Ctrl+Shift+S is "Save As" and Ctrl+Shift+R is a hard reload in many Windows apps, so the
+// Windows defaults use Alt+Shift instead. On macOS, Control+Shift combinations are rarely
+// claimed by apps, while Cmd+Shift+S is "Save As" and Cmd+Shift+3/4/5 are system captures.
+#[cfg(target_os = "macos")]
+const DEFAULT_SHORTCUTS: (&str, &str) = ("Control+Shift+S", "Control+Shift+R");
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_SHORTCUTS: (&str, &str) = ("Alt+Shift+S", "Alt+Shift+R");
+
+const AUTOSTART_INITIALIZED_KEY: &str = "autostart_initialized";
+const FULL_SCREEN_SHORTCUT_KEY: &str = "shortcut_full_screen";
+const REGION_SHORTCUT_KEY: &str = "shortcut_region";
+
+fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
+    let shortcut = Shortcut::from_str(value)
+        .map_err(|error| format!("{value} is not a valid shortcut: {error}"))?;
+    // Shift alone would take over ordinary typing, such as capital letters.
+    if !shortcut
+        .mods
+        .intersects(Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER)
+    {
+        return Err("Include Ctrl, Alt or Cmd in the shortcut.".into());
+    }
+    Ok(shortcut)
+}
+
+fn stored_shortcuts(db_path: &Path) -> CaptureShortcuts {
+    let read = |key: &str, fallback: &str| {
+        setting(db_path, key)
+            .ok()
+            .flatten()
+            .filter(|value| parse_shortcut(value).is_ok())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    CaptureShortcuts {
+        full_screen: read(FULL_SCREEN_SHORTCUT_KEY, DEFAULT_SHORTCUTS.0),
+        region: read(REGION_SHORTCUT_KEY, DEFAULT_SHORTCUTS.1),
+    }
+}
+
+/// Registers both capture shortcuts and returns a message for each one that failed.
+fn register_capture_shortcuts(app: &tauri::AppHandle, shortcuts: &CaptureShortcuts) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (value, purpose) in [
+        (&shortcuts.full_screen, "full screen"),
+        (&shortcuts.region, "region"),
+    ] {
+        let result = parse_shortcut(value).and_then(|shortcut| {
+            app.global_shortcut()
+                .register(shortcut)
+                .map_err(|error| error.to_string())
+        });
+        if let Err(error) = result {
+            errors.push(format!("{value} ({purpose}) unavailable: {error}"));
+        }
+    }
+    errors
+}
+
+#[derive(Serialize)]
+struct ShortcutSettings {
+    full_screen: String,
+    region: String,
+    default_full_screen: &'static str,
+    default_region: &'static str,
+    platform: &'static str,
+}
+
+fn shortcut_settings(shortcuts: CaptureShortcuts) -> ShortcutSettings {
+    ShortcutSettings {
+        full_screen: shortcuts.full_screen,
+        region: shortcuts.region,
+        default_full_screen: DEFAULT_SHORTCUTS.0,
+        default_region: DEFAULT_SHORTCUTS.1,
+        platform: std::env::consts::OS,
+    }
+}
+
+#[tauri::command]
+fn get_capture_shortcuts(state: tauri::State<'_, AppState>) -> Result<ShortcutSettings, String> {
+    let shortcuts = state
+        .shortcuts
+        .lock()
+        .map_err(|_| "Shortcut settings are unavailable.".to_string())?
+        .clone();
+    Ok(shortcut_settings(shortcuts))
+}
+
+/// Replaces both capture shortcuts. If either cannot be registered, for example because
+/// another app holds it, the previous shortcuts are restored and nothing is saved.
+#[tauri::command]
+async fn set_capture_shortcuts(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    full_screen: String,
+    region: String,
+) -> Result<ShortcutSettings, String> {
+    let full = parse_shortcut(&full_screen)?;
+    let select = parse_shortcut(&region)?;
+    if full == select {
+        return Err("Choose two different shortcuts.".into());
+    }
+    let previous = state
+        .shortcuts
+        .lock()
+        .map_err(|_| "Shortcut settings are unavailable.".to_string())?
+        .clone();
+    let manager = app.global_shortcut();
+    for old in [&previous.full_screen, &previous.region] {
+        if let Ok(shortcut) = parse_shortcut(old) {
+            let _ = manager.unregister(shortcut);
+        }
+    }
+    if let Err(error) = manager
+        .register(full)
+        .and_then(|()| manager.register(select))
+    {
+        let _ = manager.unregister(full);
+        let _ = manager.unregister(select);
+        let restore_errors = register_capture_shortcuts(&app, &previous);
+        if let Ok(mut status) = state.shortcut_error.lock() {
+            *status = (!restore_errors.is_empty()).then(|| restore_errors.join(". "));
+        }
+        return Err(format!(
+            "That shortcut is unavailable; another app may be using it. ({error})"
+        ));
+    }
+    let updated = CaptureShortcuts {
+        full_screen,
+        region,
+    };
+    set_setting(
+        &state.db_path,
+        FULL_SCREEN_SHORTCUT_KEY,
+        &updated.full_screen,
+    )?;
+    set_setting(&state.db_path, REGION_SHORTCUT_KEY, &updated.region)?;
+    *state
+        .shortcuts
+        .lock()
+        .map_err(|_| "Shortcut settings are unavailable.".to_string())? = updated.clone();
+    if let Ok(mut status) = state.shortcut_error.lock() {
+        *status = None;
+    }
+    Ok(shortcut_settings(updated))
+}
+
+fn set_setting(db_path: &Path, key: &str, value: &str) -> Result<(), String> {
+    Connection::open(db_path)
+        .map_err(|error| error.to_string())?
+        .execute(
+            "INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [key, value],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn setting(db_path: &Path, key: &str) -> Result<Option<String>, String> {
     Connection::open(db_path)
         .map_err(|error| error.to_string())?
         .query_row("SELECT value FROM settings WHERE key=?1", [key], |row| {
@@ -138,10 +305,7 @@ fn set_capture_display_mode(state: tauri::State<'_, AppState>, mode: String) -> 
     if mode != "active" && mode != "all" {
         return Err("Choose active or all displays.".into());
     }
-    Connection::open(&state.db_path).map_err(|error| error.to_string())?
-        .execute("INSERT INTO settings(key,value) VALUES('capture_display_mode',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [mode])
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    set_setting(&state.db_path, "capture_display_mode", &mode)
 }
 
 #[tauri::command]
@@ -158,11 +322,9 @@ fn get_capture_folder(state: tauri::State<'_, AppState>) -> String {
     state.capture_dir.to_string_lossy().to_string()
 }
 
-#[tauri::command]
-fn capture_screens_now(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<String>, String> {
+/// Captures the configured displays, hiding the main window first so it is not in the shot.
+fn capture_full_screen(app: &tauri::AppHandle) -> Result<Vec<PathBuf>, String> {
+    let state = app.state::<AppState>();
     let mode = setting(&state.db_path, "capture_display_mode")?.unwrap_or_else(|| "active".into());
     let main = app.get_webview_window("main");
     let was_visible = main
@@ -186,7 +348,12 @@ fn capture_screens_now(
         "capture-created",
         state.capture_dir.to_string_lossy().to_string(),
     );
-    Ok(paths
+    Ok(paths)
+}
+
+#[tauri::command]
+fn capture_screens_now(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    Ok(capture_full_screen(&app)?
         .into_iter()
         .map(|path| path.to_string_lossy().to_string())
         .collect())
@@ -269,12 +436,14 @@ pub fn run() {
                 Arc::clone(&import_lock),
             )
             .map_err(std::io::Error::other)?;
+            let shortcuts = stored_shortcuts(&db_path);
             app.manage(AppState {
                 db_path,
                 thumbnail_dir: thumbnail_dir.clone(),
                 capture_dir: capture_dir.clone(),
                 pending_region: Mutex::new(None),
                 shortcut_error: Mutex::new(None),
+                shortcuts: Mutex::new(shortcuts.clone()),
                 folder_watcher: Arc::new(Mutex::new(folder_watcher)),
                 import_lock: Arc::clone(&import_lock),
             });
@@ -310,57 +479,28 @@ pub fn run() {
                 }
             });
 
-            let full_screen =
-                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
-            let select_region =
-                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyR);
-            let full_screen_for_register = full_screen.clone();
-            let select_region_for_register = select_region.clone();
-            let handle = app.handle().clone();
             app.handle().plugin(
                 tauri_plugin_global_shortcut::Builder::new()
-                    .with_handler(move |app, shortcut, event| {
+                    .with_handler(|app, shortcut, event| {
                         if event.state() != ShortcutState::Pressed {
                             return;
                         }
-                        if shortcut == &full_screen {
+                        let Ok(current) = app
+                            .state::<AppState>()
+                            .shortcuts
+                            .lock()
+                            .map(|shortcuts| shortcuts.clone())
+                        else {
+                            return;
+                        };
+                        if parse_shortcut(&current.full_screen).as_ref() == Ok(shortcut) {
                             let app = app.clone();
                             tauri::async_runtime::spawn_blocking(move || {
-                                let state = app.state::<AppState>();
-                                let mode = setting(&state.db_path, "capture_display_mode")
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| "active".into());
-                                let main = app.get_webview_window("main");
-                                let was_visible = main
-                                    .as_ref()
-                                    .and_then(|window| window.is_visible().ok())
-                                    .unwrap_or(false);
-                                if was_visible {
-                                    if let Some(window) = &main {
-                                        let _ = window.hide();
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(120));
-                                }
-                                let result = capture::capture_full(&state, &mode);
-                                if was_visible {
-                                    if let Some(window) = &main {
-                                        let _ = window.show();
-                                    }
-                                }
-                                match result {
-                                    Ok(_) => {
-                                        let _ = app.emit(
-                                            "capture-created",
-                                            state.capture_dir.to_string_lossy().to_string(),
-                                        );
-                                    }
-                                    Err(error) => {
-                                        let _ = app.emit("capture-failed", error);
-                                    }
+                                if let Err(error) = capture_full_screen(&app) {
+                                    let _ = app.emit("capture-failed", error);
                                 }
                             });
-                        } else if shortcut == &select_region {
+                        } else if parse_shortcut(&current.region).as_ref() == Ok(shortcut) {
                             if let Err(error) = capture::open_region_overlay(app) {
                                 let _ = app.emit("capture-failed", error);
                             }
@@ -368,16 +508,9 @@ pub fn run() {
                     })
                     .build(),
             )?;
-            let mut shortcut_errors = Vec::new();
-            if let Err(error) = app.global_shortcut().register(full_screen_for_register) {
-                shortcut_errors.push(format!("Ctrl + Shift + S unavailable: {error}"));
-            }
-            if let Err(error) = app.global_shortcut().register(select_region_for_register) {
-                shortcut_errors.push(format!("Ctrl + Shift + R unavailable: {error}"));
-            }
+            let shortcut_errors = register_capture_shortcuts(app.handle(), &shortcuts);
             if !shortcut_errors.is_empty() {
-                *handle
-                    .state::<AppState>()
+                *app.state::<AppState>()
                     .shortcut_error
                     .lock()
                     .map_err(|_| "Capture status is unavailable.")? =
@@ -419,8 +552,19 @@ pub fn run() {
                     let _ = window.hide();
                 }
             } else if !cfg!(debug_assertions) {
-                use tauri_plugin_autostart::ManagerExt;
-                let _ = app.autolaunch().enable();
+                // Launch at sign-in starts on for a new install. It is turned on only once, so
+                // a user who switches it off in Settings is not overridden on the next launch.
+                let db_path = &app.state::<AppState>().db_path;
+                if setting(db_path, AUTOSTART_INITIALIZED_KEY)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    use tauri_plugin_autostart::ManagerExt;
+                    if app.autolaunch().enable().is_ok() {
+                        let _ = set_setting(db_path, AUTOSTART_INITIALIZED_KEY, "1");
+                    }
+                }
             }
 
             if !std::env::args().any(|argument| argument == "--background") {
@@ -439,14 +583,12 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            library::get_library_folder,
-            library::set_library_folder,
             library::get_monitored_folders,
             library::set_screenshot_category,
             add_monitored_folder,
             remove_monitored_folder,
             sync_monitored_folders,
-            library::index_folder,
+            library::index_capture_folder,
             library::list_screenshots,
             library::search_screenshots,
             library::get_ocr_image,
@@ -462,6 +604,8 @@ pub fn run() {
             get_capture_display_mode,
             set_capture_display_mode,
             get_capture_status,
+            get_capture_shortcuts,
+            set_capture_shortcuts,
             get_capture_folder,
             capture_screens_now,
             get_autostart_enabled,
@@ -472,4 +616,26 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Screenshot Memory");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_shortcuts_are_valid_and_distinct() {
+        let full = parse_shortcut(DEFAULT_SHORTCUTS.0).expect("full-screen default parses");
+        let region = parse_shortcut(DEFAULT_SHORTCUTS.1).expect("region default parses");
+        assert_ne!(full, region);
+    }
+
+    #[test]
+    fn shortcut_needs_ctrl_alt_or_cmd() {
+        assert!(parse_shortcut("S").is_err());
+        assert!(parse_shortcut("Shift+S").is_err());
+        assert!(parse_shortcut("Alt+Shift+S").is_ok());
+        assert!(parse_shortcut("Control+F9").is_ok());
+        assert!(parse_shortcut("Super+Shift+2").is_ok());
+        assert!(parse_shortcut("Alt+NotAKey").is_err());
+    }
 }

@@ -4,7 +4,7 @@ Screenshot Memory is a local-first desktop app for capturing, organizing, and fi
 
 ## How it works
 
-- **Capture in the app:** `Ctrl + Shift + S` captures the active display (or all displays, depending on Capture settings). `Ctrl + Shift + R` opens region selection. Captures are saved directly into the app's managed library.
+- **Capture in the app:** The full-screen shortcut captures the active display (or all displays, depending on Capture settings). The region shortcut opens region selection. Both shortcuts can be changed in Capture settings. Captures are saved directly into the app's managed library.
 - **Import automatically:** On Windows, the app watches the standard `Pictures/Screenshots` folder used by Snipping Tool. New image files are added to the managed library as they appear. If Snipping Tool is configured to save somewhere else, add that folder in the app's library settings.
 - **Import another folder:** Choose **Import folder** to add a folder to the watch list. Existing supported images are added to the library, and new files are watched afterward. Source files stay where they are.
 - **Find screenshots:** Local OCR extracts text in the background. Search combines full-text search, a locally generated text embedding for related wording, and a local CLIP image embedding so you can describe what a screenshot shows. The app can suggest categories and subcategories from OCR text; suggestions can be changed in the UI.
@@ -38,11 +38,13 @@ Search combines three local signals: exact words from recognized text, related w
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl + Shift + S` | Capture a display |
-| `Ctrl + Shift + R` | Select and capture a region |
+| `Alt + Shift + S` on Windows, `Control + Shift + S` on macOS | Capture a display |
+| `Alt + Shift + R` on Windows, `Control + Shift + R` on macOS | Select and capture a region |
 | `Escape` | Cancel region selection |
 
-Global shortcuts operate while the app is running, including when its window is hidden to the system tray. Choose **Quit** from the tray menu to stop the background process. Launch at sign-in is configurable in Capture settings where supported.
+Global shortcuts operate while the app is running, including when its window is hidden to the system tray. Choose **Quit** from the tray menu to stop the background process. These are the defaults; change them in Capture settings. Windows defaults avoid `Ctrl + Shift + S` and `Ctrl + Shift + R`, which many apps use for Save As and reload. A shortcut held by another app cannot be registered, and the previous shortcut stays active.
+
+Launch at sign-in is turned on once, at the first launch of a release build, and can be switched off in Capture settings; the app does not turn it back on.
 
 ## Development
 

@@ -1,0 +1,47 @@
+# Builds the frontend and runs the Rust tests on Windows and macOS for every push to main
+# and every pull request. Compiling on a macOS runner is the only macOS check this project
+# has until the app is built and tested on a Mac.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # The CLIP model is downloaded at build time from a pinned revision and verified by
+      # SHA-256 (scripts/fetch-vision-model.mjs). Caching it avoids a 150 MB download per run.
+      - uses: actions/cache@v4
+        with:
+          path: public/models/Xenova/clip-vit-base-patch32
+          key: clip-vit-base-patch32-6b7c523703ae26e39be4b03774966f8571c7f523
+
+      - run: npm ci
+
+      - name: Frontend build (model check, asset staging, TypeScript, Vite)
+        run: npm run build
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked

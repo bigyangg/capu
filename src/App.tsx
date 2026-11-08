@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -225,6 +225,94 @@ function formatBytes(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+type ShortcutSettings = {
+  full_screen: string;
+  region: string;
+  default_full_screen: string;
+  default_region: string;
+  platform: string;
+};
+
+// Shortcuts are stored as accelerator strings such as "Alt+Shift+S" and shown with the
+// key names used on the current operating system.
+function shortcutParts(value: string, platform: string) {
+  const mac = platform === "macos";
+  const names: Record<string, string> = {
+    control: mac ? "Control" : "Ctrl",
+    ctrl: mac ? "Control" : "Ctrl",
+    alt: mac ? "Option" : "Alt",
+    option: mac ? "Option" : "Alt",
+    shift: "Shift",
+    super: mac ? "Cmd" : "Win",
+    cmd: mac ? "Cmd" : "Win",
+    command: mac ? "Cmd" : "Win",
+  };
+  return value.split("+").map((part) => names[part.trim().toLowerCase()] ?? part.trim().toUpperCase());
+}
+
+function formatShortcut(value: string, platform: string) {
+  return shortcutParts(value, platform).join(" + ");
+}
+
+function keyFromCode(code: string) {
+  const letter = /^Key([A-Z])$/.exec(code);
+  if (letter) return letter[1];
+  const digit = /^Digit([0-9])$/.exec(code);
+  if (digit) return digit[1];
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
+  return null;
+}
+
+function ShortcutRecorder({ label, value, platform, disabled, onChange }: {
+  label: string;
+  value: string;
+  platform: string;
+  disabled: boolean;
+  onChange: (value: string) => void;
+}) {
+  const [recording, setRecording] = useState(false);
+  const [hint, setHint] = useState<string | null>(null);
+  const mac = platform === "macos";
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (!recording) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Escape") {
+      setRecording(false);
+      setHint(null);
+      return;
+    }
+    const key = keyFromCode(event.code);
+    if (!key) {
+      if (!["Control", "Alt", "Shift", "Meta"].includes(event.key)) setHint("Use a letter, number or function key.");
+      return;
+    }
+    if (!(event.ctrlKey || event.altKey || event.metaKey)) {
+      setHint(mac ? "Hold Control, Option or Cmd with the key." : "Hold Ctrl or Alt with the key.");
+      return;
+    }
+    const parts = [event.ctrlKey && "Control", event.altKey && "Alt", event.shiftKey && "Shift", event.metaKey && "Super", key].filter(Boolean);
+    setRecording(false);
+    setHint(null);
+    onChange(parts.join("+"));
+  };
+  return <div className="shortcut-row">
+    <span>{label}</span>
+    <button
+      type="button"
+      className={recording ? "shortcut-recorder recording" : "shortcut-recorder"}
+      disabled={disabled}
+      aria-label={recording ? `Press the new ${label.toLowerCase()} shortcut, or Escape to cancel` : `${label} shortcut: ${formatShortcut(value, platform)}. Activate to change.`}
+      onClick={() => { setRecording(true); setHint(null); }}
+      onBlur={() => setRecording(false)}
+      onKeyDown={onKeyDown}
+    >
+      {recording ? "Press keys…" : shortcutParts(value, platform).map((part) => <kbd key={part}>{part}</kbd>)}
+    </button>
+    {hint && <small>{hint}</small>}
+  </div>;
+}
+
 function LibraryApp() {
   const [folder, setFolder] = useState<string | null>(null);
   const [managedCaptureFolder, setManagedCaptureFolder] = useState<string | null>(null);
@@ -246,6 +334,8 @@ function LibraryApp() {
   const [captureMode, setCaptureMode] = useState<"active" | "all">("active");
   const [autostart, setAutostart] = useState(false);
   const [captureStatus, setCaptureStatus] = useState<string | null>(null);
+  const [shortcuts, setShortcuts] = useState<ShortcutSettings | null>(null);
+  const [shortcutBusy, setShortcutBusy] = useState(false);
   const [filter, setFilter] = useState<"all" | "recent" | "attention">("all");
   const [categoryFilter, setCategoryFilter] = useState<string | null>(null);
   const [subcategoryFilter, setSubcategoryFilter] = useState<string | null>(null);
@@ -339,22 +429,23 @@ function LibraryApp() {
     void (async () => {
       setLoading(true);
       try {
-        const [savedFolder, captureFolder, savedMode, autostartEnabled, shortcutStatus, watchedFolders] = await Promise.all([
-          invoke<string | null>("get_library_folder"),
+        const [captureFolder, savedMode, autostartEnabled, shortcutStatus, watchedFolders, captureShortcuts] = await Promise.all([
           invoke<string>("get_capture_folder"),
           invoke<"active" | "all">("get_capture_display_mode"),
           invoke<boolean>("get_autostart_enabled"),
           invoke<string | null>("get_capture_status"),
           invoke<string[]>("get_monitored_folders"),
+          invoke<ShortcutSettings>("get_capture_shortcuts"),
         ]);
         if (cancelled) return;
-        setFolder(savedFolder ?? captureFolder);
+        setFolder(captureFolder);
+        setShortcuts(captureShortcuts);
         setManagedCaptureFolder(captureFolder);
         setCaptureMode(savedMode);
         setAutostart(autostartEnabled);
         setCaptureStatus(shortcutStatus);
         setMonitoredFolders(watchedFolders);
-        const existing = await invoke<IndexReport>("index_folder", { folder: captureFolder });
+        const existing = await invoke<IndexReport>("index_capture_folder");
         if (!cancelled) setItems(existing.screenshots);
         const sync = await invoke<ImportSummary>("sync_monitored_folders");
         if (!cancelled) {
@@ -509,9 +600,9 @@ function LibraryApp() {
     let unlistenImported: (() => void) | undefined;
     let unlistenImportFailed: (() => void) | undefined;
     let unlistenRemoved: (() => void) | undefined;
-    void listen<string>("capture-created", async (event) => {
+    void listen<string>("capture-created", async () => {
       try {
-        const report = await invoke<IndexReport>("index_folder", { folder: event.payload });
+        const report = await invoke<IndexReport>("index_capture_folder");
         setItems(report.screenshots);
         setNotice(`${report.indexed} new capture${report.indexed === 1 ? "" : "s"} saved and indexing locally.`);
         setError(null);
@@ -579,6 +670,19 @@ function LibraryApp() {
     }
   };
 
+  const updateShortcuts = async (fullScreen: string, region: string) => {
+    setShortcutBusy(true);
+    try {
+      setShortcuts(await invoke<ShortcutSettings>("set_capture_shortcuts", { fullScreen, region }));
+      setCaptureStatus(null);
+      setError(null);
+    } catch (cause) {
+      setError(`Could not change the shortcut: ${String(cause)}`);
+    } finally {
+      setShortcutBusy(false);
+    }
+  };
+
   const updateCategory = async (screenshot: Screenshot, choice: CategoryChoice) => {
     try {
       await invoke("set_screenshot_category", { id: screenshot.id, ...choice });
@@ -610,13 +714,13 @@ function LibraryApp() {
     return () => window.removeEventListener("keydown", onShortcut);
   }, []);
 
-  const scanFolder = async (selectedFolder = folder) => {
-    if (!selectedFolder) return;
+  const scanFolder = async () => {
+    if (!folder) return;
     setScanning(true);
     setError(null);
     setNotice("Checking the selected folder and building your local library…");
     try {
-      const report = await invoke<IndexReport>("index_folder", { folder: selectedFolder });
+      const report = await invoke<IndexReport>("index_capture_folder");
       setItems(report.screenshots);
       const details = [
         `${report.indexed} added`,
@@ -757,6 +861,8 @@ function LibraryApp() {
   ), [categoryFilter, items]);
   const currentLocationTitle = query ? "Search results" : filter === "attention" ? "Needs attention" : filter === "recent" ? "Recent screenshots" : subcategoryFilter === "__all__" ? `All ${categoryFilter}` : subcategoryFilter ?? categoryFilter ?? "All Screenshots";
   const currentLocationCount = query || filter !== "all" || subcategoryFilter ? visibleItems.length : categoryFilter ? categoryCounts[categoryFilter] ?? 0 : items.length;
+  const platform = shortcuts?.platform ?? (navigator.userAgent.includes("Mac") ? "macos" : "windows");
+  const fullScreenLabel = shortcuts ? formatShortcut(shortcuts.full_screen, platform) : null;
   const showScreenshotBrowser = !!query || filter !== "all" || !!categoryFilter;
 
   return (
@@ -770,7 +876,7 @@ function LibraryApp() {
         <button className="new-capture" onClick={() => void invoke("capture_screens_now").catch((cause) => setError(String(cause)))}>
           <ImagePlus size={16} />
           <span>Capture</span>
-          <span className="new-capture-shortcut">Ctrl+Shift+S</span>
+          {shortcuts && <span className="new-capture-shortcut">{shortcutParts(shortcuts.full_screen, platform).join("+")}</span>}
         </button>
 
         <div className="nav-label">LIBRARY</div>
@@ -802,7 +908,6 @@ function LibraryApp() {
             <button className="folder-entry" title={folder} onClick={() => { setFilter("all"); setCategoryFilter(null); setSubcategoryFilter(null); setQuery(""); }}>
               <span className="source-folder-icon"><Folder size={17} /></span><span className="source-folder-copy"><strong>{folder === managedCaptureFolder ? "Screenshot Memory" : folder.split(/[\\/]/).filter(Boolean).slice(-1)[0] ?? "Selected folder"}</strong><small>{folder === managedCaptureFolder ? "Managed automatically on this device" : "Imported and watched locally"}</small></span>
             </button>
-            {folder !== managedCaptureFolder && <button className="source-scan" title="Check this folder now" aria-label="Check this folder now" onClick={() => void scanFolder()}><RotateCw size={15} /></button>}
           </div>
         ) : <div className="folder-empty">Choose a folder to add screenshots to your library.</div>}
 
@@ -837,14 +942,13 @@ function LibraryApp() {
             <div className="heading-actions">
               <button className="button primary-button" onClick={() => void invoke("capture_screens_now").catch((cause) => setError(String(cause)))} title="Save a new screenshot to your local library"><ImagePlus size={15} /> Capture screenshot</button>
               <button className="button secondary-button" onClick={() => void selectLibrary()} title="Import an existing folder and watch it for new screenshots"><FolderOpen size={15} /> Import folder</button>
-              {folder !== managedCaptureFolder && <button className="icon-button toolbar-scan" onClick={() => void scanFolder()} disabled={!folder || scanning} title="Check source folder now" aria-label="Check source folder now"><RotateCw size={16} className={scanning ? "spin" : ""} /></button>}
             </div>
           </section>
 
           <section className="search-panel" aria-label="Search screenshots">
             <Search size={19} className="search-icon" />
             <input ref={searchInputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={categoryFilter ? `Search in ${subcategoryFilter && subcategoryFilter !== "__all__" ? subcategoryFilter : categoryFilter}…` : "Search all screenshots…"} aria-label={categoryFilter ? `Search screenshots in ${subcategoryFilter && subcategoryFilter !== "__all__" ? subcategoryFilter : categoryFilter}` : "Search all screenshots by text or meaning"} />
-            {query ? <button className="clear-search" onClick={() => setQuery("")} aria-label="Clear search"><X size={15} /></button> : <kbd>Ctrl K</kbd>}
+            {query ? <button className="clear-search" onClick={() => setQuery("")} aria-label="Clear search"><X size={15} /></button> : <kbd>{platform === "macos" ? "Cmd K" : "Ctrl K"}</kbd>}
             <span className="search-divider" />
             <span className="search-scope">{categoryFilter ? "This folder" : "Entire library"}</span>
           </section>
@@ -857,7 +961,7 @@ function LibraryApp() {
             </div>
             {items.length === 0 && <div className="first-capture-card">
               <div className="first-capture-icon"><ImagePlus size={20} /></div>
-              <div className="first-capture-copy"><span>READY WHEN YOU ARE</span><h3>Your private library is ready</h3><p>Capture with <kbd>Ctrl</kbd> <kbd>Shift</kbd> <kbd>S</kbd>. Screenshots are stored on this device, read locally, and organized into topic folders for you.</p></div>
+              <div className="first-capture-copy"><span>READY WHEN YOU ARE</span><h3>Your private library is ready</h3><p>Capture with {shortcuts ? shortcutParts(shortcuts.full_screen, platform).map((part, index) => <span key={part}>{index > 0 && " "}<kbd>{part}</kbd></span>) : "the Capture button"}. Screenshots are stored on this device, read locally, and organized into topic folders for you.</p></div>
               <button className="button primary-button" onClick={() => void invoke("capture_screens_now").catch((cause) => setError(String(cause)))}><ImagePlus size={15} /> Capture screenshot</button>
             </div>}
           </section>}
@@ -969,7 +1073,9 @@ function LibraryApp() {
         <div className="settings-heading"><div><span className="detail-overline">PREFERENCES</span><h2>Library settings</h2></div><button className="icon-button" onClick={() => setSettingsOpen(false)} aria-label="Close settings"><X size={17} /></button></div>
         <div className="settings-section monitor-settings">
           <h3>Automatic importing</h3>
-          <p>Screenshot Memory manages its private library automatically. Windows Snipping Tool captures are watched by default; add another folder only if you want screenshots from a different location. Originals stay in place.</p>
+          <p>{platform === "windows"
+            ? "Screenshot Memory manages its private library automatically. Windows Snipping Tool captures are watched by default; add another folder only if you want screenshots from a different location. Originals stay in place."
+            : "Screenshot Memory manages its private library automatically. Add a folder to import the screenshots saved there and any new ones. Originals stay in place."}</p>
           <button className="button secondary-button monitor-add" onClick={() => void addMonitoredFolder()} disabled={monitorBusy}>
             {monitorBusy ? <LoaderCircle size={14} className="spin" /> : <FolderOpen size={14} />}
             {monitorBusy ? "Adding folder..." : "Add folder to watch"}
@@ -981,14 +1087,21 @@ function LibraryApp() {
             </div>)}
           </div> : <div className="monitor-empty">No monitored folders yet.</div>}
         </div>
-        <div className="settings-section"><h3>Full screen capture</h3><p>Choose which display Ctrl + Shift + S captures.</p>
+        <div className="settings-section"><h3>Full screen capture</h3><p>Choose which display {fullScreenLabel ?? "the full-screen shortcut"} captures.</p>
           <label className="setting-choice"><input type="radio" name="capture-mode" checked={captureMode === "active"} onChange={() => { setCaptureMode("active"); void invoke("set_capture_display_mode", { mode: "active" }).catch((cause) => setError(String(cause))); }} /><span><strong>Active display</strong><small>Capture the display under your pointer.</small></span></label>
           <label className="setting-choice"><input type="radio" name="capture-mode" checked={captureMode === "all"} onChange={() => { setCaptureMode("all"); void invoke("set_capture_display_mode", { mode: "all" }).catch((cause) => setError(String(cause))); }} /><span><strong>All displays</strong><small>Save one screenshot for each connected display.</small></span></label>
         </div>
         <div className="settings-section"><h3>Run in background</h3><p>Keep capture shortcuts active after the window closes and when you sign in.</p>
           <label className="setting-toggle"><span><strong>Start at sign in</strong><small>Screenshot Memory stays available in the tray.</small></span><input type="checkbox" checked={autostart} onChange={(event) => { const value = event.currentTarget.checked; setAutostart(value); void invoke("set_autostart_enabled", { enabled: value }).catch((cause) => { setAutostart(!value); setError(String(cause)); }); }} /></label>
         </div>
-        <div className="shortcut-summary"><strong>Global shortcuts</strong><span>Ctrl + Shift + S · Full screen</span><span>Ctrl + Shift + R · Select region</span>{captureStatus && <small>{captureStatus}</small>}</div>
+        <div className="settings-section"><h3>Global shortcuts</h3><p>These work in any app while Screenshot Memory is running. Select a shortcut, then press the new keys.</p>
+          {shortcuts && <>
+            <ShortcutRecorder label="Full screen" value={shortcuts.full_screen} platform={platform} disabled={shortcutBusy} onChange={(value) => void updateShortcuts(value, shortcuts.region)} />
+            <ShortcutRecorder label="Select region" value={shortcuts.region} platform={platform} disabled={shortcutBusy} onChange={(value) => void updateShortcuts(shortcuts.full_screen, value)} />
+            {(shortcuts.full_screen !== shortcuts.default_full_screen || shortcuts.region !== shortcuts.default_region) && <button className="text-button shortcut-reset" disabled={shortcutBusy} onClick={() => void updateShortcuts(shortcuts.default_full_screen, shortcuts.default_region)}>Restore defaults</button>}
+          </>}
+          {captureStatus && <small className="shortcut-status">{captureStatus}</small>}
+        </div>
       </section></div>}
     </div>
   );
