@@ -84,11 +84,11 @@ pub fn open_region_overlay(app: &tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
     let monitor = active_monitor()?;
+    // Beside the captures folder, in the app's data folder.
     let preview_path = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
-        .join("region-preview.png");
+        .state::<AppState>()
+        .capture_dir
+        .with_file_name("region-preview.png");
     monitor
         .capture_image()
         .map_err(|error| error.to_string())?

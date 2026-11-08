@@ -65,6 +65,16 @@ npm install
 npm run tauri dev
 ```
 
+To run a development build beside an installed copy without sharing its library, give it its own data folder and WebView2 profile. In PowerShell:
+
+```powershell
+$env:SCREENSHOT_MEMORY_DEV_DATA = "$env:TEMP\screenshot-memory-dev"
+$env:WEBVIEW2_USER_DATA_FOLDER = "$env:TEMP\screenshot-memory-dev\webview"
+npm run tauri dev
+```
+
+With `SCREENSHOT_MEMORY_DEV_DATA` set, the default Snipping Tool folder is not watched; put test images in its `captures` folder. Release builds ignore the variable.
+
 Build the frontend and TypeScript:
 
 ```sh

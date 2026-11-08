@@ -437,7 +437,16 @@ pub fn run() {
             Some(vec!["--background"]),
         ))
         .setup(|app| {
-            let app_data = app.path().app_data_dir()?;
+            // Development builds only: SCREENSHOT_MEMORY_DEV_DATA points the app at a separate
+            // data folder, so a test build can run beside the installed app without sharing its
+            // library. It also skips the default Snipping Tool folder. Ignored in release builds.
+            let dev_data = std::env::var_os("SCREENSHOT_MEMORY_DEV_DATA")
+                .filter(|_| cfg!(debug_assertions))
+                .map(PathBuf::from);
+            let app_data = match &dev_data {
+                Some(folder) => folder.clone(),
+                None => app.path().app_data_dir()?,
+            };
             std::fs::create_dir_all(&app_data)?;
             let thumbnail_dir = app_data.join("thumbnails");
             let capture_dir = app_data.join("captures");
@@ -450,7 +459,7 @@ pub fn run() {
             // Watch that dedicated folder so new snips enter the managed library
             // without asking users to refresh or manually add the common location.
             #[cfg(target_os = "windows")]
-            if let Ok(pictures_dir) = app.path().picture_dir() {
+            if let (None, Ok(pictures_dir)) = (&dev_data, app.path().picture_dir()) {
                 let snipping_folder = pictures_dir.join("Screenshots");
                 match std::fs::create_dir_all(&snipping_folder)
                     .and_then(|()| std::fs::canonicalize(&snipping_folder))
