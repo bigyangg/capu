@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { IdleWorker } from "./modelWorkers";
 import { listen } from "@tauri-apps/api/event";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import {
@@ -41,7 +42,8 @@ type Screenshot = {
   status: "pending" | "indexed" | "error" | "missing" | "unavailable" | string;
   ocr_text: string;
   last_error: string | null;
-  thumbnail_data_url: string | null;
+  /** Content hash of the thumbnail, served by the app's thumb:// protocol. */
+  thumbnail: string | null;
   category: string | null;
   subcategory: string | null;
   suggested_category: string | null;
@@ -161,14 +163,17 @@ function FolderTile({ name, description, count, tone, compact = false, onOpen }:
   </button>;
 }
 
-type OcrMessage =
-  | { type: "progress"; id: number; progress: number; status: string }
-  | { type: "result"; id: number; text: string; embedding?: number[]; semanticError?: string }
-  | { type: "embedding"; id: number; embedding: number[] }
-  | { type: "error"; id: number; error: string };
-
-type WorkerResult = { text?: string; embedding?: number[]; semanticError?: string; error?: string };
 type SemanticText = { id: number; text: string };
+
+function thumbnailUrl(hash: string) {
+  return convertFileSrc(hash, "thumb");
+}
+
+// Model workers are shut down when idle to give their memory back. Indexing finishes in
+// bursts, so its worker stops soon after; search models stay a little longer so a few
+// searches in a row stay instant.
+const INDEX_WORKER_IDLE_MS = 15_000;
+const SEARCH_WORKER_IDLE_MS = 3 * 60_000;
 
 const dateFormat = new Intl.DateTimeFormat(undefined, {
   month: "short",
@@ -364,43 +369,26 @@ function LibraryApp() {
   const [monitorBusy, setMonitorBusy] = useState(false);
   const [recentImportCount, setRecentImportCount] = useState(0);
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const workerRef = useRef<Worker | null>(null);
-  // Visual search runs in its own worker so image indexing proceeds in parallel with OCR.
-  const visualWorkerRef = useRef<Worker | null>(null);
-  const pendingJobs = useRef(new Map<number, (result: WorkerResult) => void>());
+  // OCR and image vectors for new screenshots; text vectors for typed searches.
+  const indexWorker = useRef<IdleWorker | null>(null);
+  const searchWorker = useRef<IdleWorker | null>(null);
   const runningJobs = useRef(new Set<number>());
-  const nextWorkerJobId = useRef(1_000_000_000);
   const semanticBackfillRunning = useRef(false);
   const visualBackfillRunning = useRef(false);
   const visualBackfillRequested = useRef(false);
   const visualBackfillFailed = useRef(new Set<number>());
 
-  const requestVector = useCallback((worker: Worker | null, message: Record<string, unknown>) => {
-    if (!worker) return Promise.reject(new Error("Local search models are not ready."));
-    const id = ++nextWorkerJobId.current;
-    return new Promise<number[]>((resolve, reject) => {
-      pendingJobs.current.set(id, (result) => {
-        if (result.error) reject(new Error(result.error));
-        else if (result.embedding) resolve(result.embedding);
-        else reject(new Error("The local model returned no vector."));
-      });
-      worker.postMessage({ ...message, id });
-    });
-  }, []);
-
-  const requestEmbedding = useCallback(
-    (text: string) => requestVector(workerRef.current, { type: "embed", text }),
-    [requestVector],
-  );
-
   const refresh = useCallback(async (search = "") => {
     try {
       let response: Screenshot[];
       if (search.trim()) {
-        const [meaning, visual] = await Promise.allSettled([
-          requestEmbedding(search),
-          requestVector(visualWorkerRef.current, { type: "visual-query", text: search }),
-        ]);
+        const worker = searchWorker.current;
+        const [meaning, visual] = worker
+          ? await Promise.allSettled([
+            worker.vector({ type: "embed", text: search }),
+            worker.vector({ type: "visual-query", text: search }),
+          ])
+          : [{ status: "rejected" as const, reason: null }, { status: "rejected" as const, reason: null }];
         const embedding = meaning.status === "fulfilled" ? meaning.value : [];
         const imageQueryEmbedding = visual.status === "fulfilled" ? visual.value : [];
         if (meaning.status === "rejected") setNotice("Showing text matches while local meaning search prepares.");
@@ -415,34 +403,13 @@ function LibraryApp() {
       setError(String(cause));
       return [];
     }
-  }, [requestEmbedding, requestVector]);
+  }, []);
 
   useEffect(() => {
-    const connectWorker = (label: string) => {
-      const worker = new Worker(new URL("./ocr.worker.ts", import.meta.url), { type: "module" });
-      worker.onmessage = (event: MessageEvent<OcrMessage>) => {
-        const message = event.data;
-        if (message.type === "progress") {
-          setOcrProgress(message.progress);
-          return;
-        }
-        const resolve = pendingJobs.current.get(message.id);
-        pendingJobs.current.delete(message.id);
-        if (message.type === "result") resolve?.({ text: message.text, embedding: message.embedding, semanticError: message.semanticError });
-        else if (message.type === "embedding") resolve?.({ embedding: message.embedding });
-        else resolve?.({ error: message.error });
-      };
-      worker.onerror = (event) => {
-        setError(`${label} failed: ${event.message}`);
-        for (const resolve of pendingJobs.current.values()) resolve({ error: event.message });
-        pendingJobs.current.clear();
-      };
-      return worker;
-    };
-    const worker = connectWorker("Local OCR worker");
-    const visualWorker = connectWorker("Local visual search worker");
-    workerRef.current = worker;
-    visualWorkerRef.current = visualWorker;
+    const index = new IdleWorker("Local indexing", INDEX_WORKER_IDLE_MS, { onProgress: setOcrProgress, onCrash: setError });
+    const search = new IdleWorker("Local search", SEARCH_WORKER_IDLE_MS, { onCrash: setError });
+    indexWorker.current = index;
+    searchWorker.current = search;
 
     let cancelled = false;
     void (async () => {
@@ -483,16 +450,15 @@ function LibraryApp() {
 
     return () => {
       cancelled = true;
-      worker.terminate();
-      visualWorker.terminate();
-      workerRef.current = null;
-      visualWorkerRef.current = null;
-      pendingJobs.current.clear();
+      index.stop();
+      search.stop();
+      indexWorker.current = null;
+      searchWorker.current = null;
     };
   }, []);
 
   const runOcr = useCallback(async (screenshots: Screenshot[]) => {
-    const worker = workerRef.current;
+    const worker = indexWorker.current;
     if (!worker) return;
     const queue = screenshots.filter((item) => item.status === "pending" && !runningJobs.current.has(item.id));
     if (!queue.length) return;
@@ -505,10 +471,7 @@ function LibraryApp() {
       setOcrProgress(queue.length ? complete / queue.length : 0);
       try {
         const imageDataUrl = await invoke<string>("get_ocr_image", { id: screenshot.id });
-        const result = await new Promise<WorkerResult>((resolve) => {
-          pendingJobs.current.set(screenshot.id, resolve);
-          worker.postMessage({ type: "ocr", id: screenshot.id, imageDataUrl });
-        });
+        const result = await worker.run({ type: "ocr", imageDataUrl });
         if (result.error) throw new Error(result.error);
         const text = result.text ?? "";
         await invoke("save_ocr_text", { id: screenshot.id, text, embedding: result.embedding ?? null });
@@ -541,7 +504,9 @@ function LibraryApp() {
       setNotice(`Preparing local meaning search for ${queue.length} screenshots...`);
       for (const item of queue) {
         try {
-          const embedding = await requestEmbedding(item.text);
+          const worker = indexWorker.current;
+          if (!worker) break;
+          const embedding = await worker.vector({ type: "embed", text: item.text });
           await invoke("save_semantic_embedding", { id: item.id, embedding });
         } catch (cause) {
           setError(`Local meaning search could not index ${item.id}: ${String(cause)}`);
@@ -561,7 +526,7 @@ function LibraryApp() {
     } finally {
       semanticBackfillRunning.current = false;
     }
-  }, [query, refresh, requestEmbedding]);
+  }, [query, refresh]);
 
   useEffect(() => {
     if (loading) return;
@@ -590,7 +555,9 @@ function LibraryApp() {
           if (!batch.length) break;
           for (const item of batch) {
             try {
-              const embedding = await requestVector(visualWorkerRef.current, { type: "image-embed", imageDataUrl: item.image_data_url });
+              const worker = indexWorker.current;
+              if (!worker) return;
+              const embedding = await worker.vector({ type: "image-embed", imageDataUrl: item.image_data_url });
               await invoke("save_image_embedding", { id: item.id, embedding });
               complete += 1;
             } catch {
@@ -607,7 +574,7 @@ function LibraryApp() {
     } finally {
       visualBackfillRunning.current = false;
     }
-  }, [requestVector]);
+  }, []);
 
   useEffect(() => {
     if (!loading) void runVisualBackfill();
@@ -836,7 +803,7 @@ function LibraryApp() {
       .then((image) => { if (current) setDetailImage(image); })
       .catch((cause) => {
         if (!current) return;
-        setDetailImage(selected.thumbnail_data_url);
+        setDetailImage(selected.thumbnail ? thumbnailUrl(selected.thumbnail) : null);
         setDetailImageError(`Showing a smaller preview. ${String(cause)}`);
       })
       .finally(() => { if (current) setDetailImageBusy(false); });
@@ -1016,7 +983,7 @@ function LibraryApp() {
 
           <section className="search-panel" aria-label="Search screenshots">
             <Search size={19} className="search-icon" />
-            <input ref={searchInputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={categoryFilter ? `Search in ${subcategoryFilter && subcategoryFilter !== "__all__" ? subcategoryFilter : categoryFilter}…` : "Search all screenshots…"} aria-label={categoryFilter ? `Search screenshots in ${subcategoryFilter && subcategoryFilter !== "__all__" ? subcategoryFilter : categoryFilter}` : "Search all screenshots by text or meaning"} />
+            <input ref={searchInputRef} onFocus={() => void searchWorker.current?.run({ type: "warm-search" })} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={categoryFilter ? `Search in ${subcategoryFilter && subcategoryFilter !== "__all__" ? subcategoryFilter : categoryFilter}…` : "Search all screenshots…"} aria-label={categoryFilter ? `Search screenshots in ${subcategoryFilter && subcategoryFilter !== "__all__" ? subcategoryFilter : categoryFilter}` : "Search all screenshots by text or meaning"} />
             {query ? <button className="clear-search" onClick={() => setQuery("")} aria-label="Clear search"><X size={15} /></button> : <kbd>{platform === "macos" ? "Cmd K" : "Ctrl K"}</kbd>}
             <span className="search-divider" />
             <span className="search-scope">{categoryFilter ? "This folder" : "Entire library"}</span>
@@ -1077,7 +1044,7 @@ function LibraryApp() {
             <div className="capture-grid" aria-label="Screenshot thumbnails">
               {visibleItems.map((item) => <article className={`capture-card ${selected?.id === item.id ? "selected-card" : ""}`} key={item.id}>
                 <button className="capture-thumb" onClick={() => setSelected(item)} aria-label={`Preview ${item.file_name}`} title={item.file_name}>
-                  {item.thumbnail_data_url ? <img src={item.thumbnail_data_url} alt="" loading="lazy" /> : <span className="capture-thumb-fallback"><FileImage size={28} /></span>}
+                  {item.thumbnail ? <img src={thumbnailUrl(item.thumbnail)} alt="" loading="lazy" decoding="async" /> : <span className="capture-thumb-fallback"><FileImage size={28} /></span>}
                   {item.status !== "indexed" && <span className={`capture-status ${item.status}`} role="status">{item.status === "pending" ? <><LoaderCircle size={11} className="spin" /> Indexing</> : item.status === "missing" ? <><AlertCircle size={11} /> Missing</> : item.status === "unavailable" ? <><AlertCircle size={11} /> Folder offline</> : <><AlertCircle size={11} /> Needs attention</>}</span>}
                   <span className="capture-hover-hint">Quick Look</span>
                 </button>
@@ -1093,7 +1060,7 @@ function LibraryApp() {
             <div className="file-list" role="list" aria-label="Screenshots">
               {visibleItems.map((item) => <article className={`file-row ${selected?.id === item.id ? "selected-card" : ""}`} key={item.id} role="listitem">
                 <button className="file-open" onClick={() => setSelected(item)} aria-label={`Open details for ${item.file_name}`}>
-                  <span className="file-row-thumb">{item.thumbnail_data_url ? <img src={item.thumbnail_data_url} alt="" loading="lazy" /> : <FileImage size={19} />}<span className={`status-indicator ${item.status}`} title={item.status} /></span>
+                  <span className="file-row-thumb">{item.thumbnail ? <img src={thumbnailUrl(item.thumbnail)} alt="" loading="lazy" decoding="async" /> : <FileImage size={19} />}<span className={`status-indicator ${item.status}`} title={item.status} /></span>
                   <span className="file-main"><strong title={item.file_name}>{item.file_name}</strong><small>{prettyDate(item.captured_at)} <i /> {formatBytes(item.file_size)} <i /> {item.subcategory ?? item.category ?? "Unfiled"}</small>
                     {item.match_reason && <em><Sparkles size={11} /> {item.match_reason}</em>}
                     {item.ocr_text && <span className="ocr-snippet">{item.ocr_text.slice(0, 125).replace(/\s+/g, " ")}</span>}

@@ -16,7 +16,8 @@ type OcrRequest = { type: "ocr"; id: number; imageDataUrl: string };
 type EmbeddingRequest = { type: "embed"; id: number; text: string };
 type ImageEmbeddingRequest = { type: "image-embed"; id: number; imageDataUrl: string };
 type VisualQueryRequest = { type: "visual-query"; id: number; text: string };
-type WorkerRequest = OcrRequest | EmbeddingRequest | ImageEmbeddingRequest | VisualQueryRequest;
+type WarmSearchRequest = { type: "warm-search"; id: number };
+type WorkerRequest = OcrRequest | EmbeddingRequest | ImageEmbeddingRequest | VisualQueryRequest | WarmSearchRequest;
 type WorkerScope = {
   location: Location;
   postMessage: (message: unknown) => void;
@@ -104,24 +105,39 @@ async function embedImage(imageDataUrl: string) {
   return normalized(image_embeds.data as Float32Array);
 }
 
-async function embedVisualQuery(text: string) {
+async function loadVisualTextModel() {
   if (!visualTextModel || !visualTokenizer) {
     useLocalModels();
     visualTokenizer = await AutoTokenizer.from_pretrained(VISUAL_MODEL);
     visualTextModel = await CLIPTextModelWithProjection.from_pretrained(VISUAL_MODEL, { device: "wasm", dtype: "q8" });
   }
+  return { visualTokenizer, visualTextModel };
+}
+
+async function embedVisualQuery(text: string) {
+  const { visualTokenizer, visualTextModel } = await loadVisualTextModel();
   const inputs = visualTokenizer([text], { padding: "max_length", truncation: true });
   const { text_embeds } = await visualTextModel(inputs);
   return normalized(text_embeds.data as Float32Array);
 }
 
+const TILE_WIDTH = 1500;
+const TILE_HEIGHT = 1100;
+
+// Splits a large image into overlapping tiles so small text is read at a larger relative
+// size. An image that fits in one tile returns no tiles: reading it again would repeat the
+// full-page pass on the same pixels.
 async function imageTiles(imageDataUrl: string) {
   const response = await fetch(imageDataUrl);
   const bitmap = await createImageBitmap(await response.blob());
   const width = bitmap.width;
   const height = bitmap.height;
-  const tileWidth = Math.min(1500, width);
-  const tileHeight = Math.min(1100, height);
+  if (width <= TILE_WIDTH && height <= TILE_HEIGHT) {
+    bitmap.close();
+    return [];
+  }
+  const tileWidth = Math.min(TILE_WIDTH, width);
+  const tileHeight = Math.min(TILE_HEIGHT, height);
   const overlap = 180;
   const stepX = Math.max(1, tileWidth - overlap);
   const stepY = Math.max(1, tileHeight - overlap);
@@ -141,7 +157,7 @@ async function imageTiles(imageDataUrl: string) {
     if (y + tileHeight >= height) break;
   }
   bitmap.close();
-  return tiles.length ? tiles : [imageDataUrl];
+  return tiles;
 }
 
 function mergeOcr(parts: string[]) {
@@ -167,6 +183,13 @@ async function processRequest(message: WorkerRequest) {
     if (message.type === "image-embed") {
       const embedding = await embedImage(message.imageDataUrl);
       scope.postMessage({ type: "embedding", id, embedding });
+      return;
+    }
+    if (message.type === "warm-search") {
+      // Loads both search models ahead of the first query, for example when the search box
+      // gets focus, so typing does not wait for them.
+      await Promise.all([getSemanticModel(), loadVisualTextModel()]);
+      scope.postMessage({ type: "ready", id });
       return;
     }
     if (message.type === "visual-query") {

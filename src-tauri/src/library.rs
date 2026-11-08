@@ -33,7 +33,9 @@ pub struct Screenshot {
     status: String,
     ocr_text: String,
     last_error: Option<String>,
-    thumbnail_data_url: Option<String>,
+    /// Content hash naming the thumbnail; the web view loads it from the thumb:// protocol
+    /// only when it is shown, instead of every list carrying every image.
+    thumbnail: Option<String>,
     category: Option<String>,
     subcategory: Option<String>,
     suggested_category: Option<String>,
@@ -1452,6 +1454,16 @@ pub async fn remove_missing_screenshot(state: State<'_, AppState>, id: i64) -> R
     .map_err(|error| format!("Remove task failed: {error}"))?
 }
 
+/// Reads a thumbnail for the thumb:// protocol. Thumbnails are named by the SHA-256 of their
+/// screenshot, so only a 64-character hex name is accepted and nothing outside the thumbnail
+/// folder can be requested.
+pub fn read_thumbnail(thumbnail_dir: &Path, name: &str) -> Option<Vec<u8>> {
+    let valid = name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit());
+    valid
+        .then(|| fs::read(thumbnail_dir.join(format!("{name}.jpg"))).ok())
+        .flatten()
+}
+
 /// Opens a library screenshot in the system's default image viewer. The path comes from
 /// the library, not from the web view.
 #[tauri::command]
@@ -2085,9 +2097,12 @@ fn screenshot_from_row(
     folders: &mut HashMap<PathBuf, bool>,
 ) -> Result<Screenshot, rusqlite::Error> {
     let thumbnail_path: Option<String> = row.get(8)?;
-    let thumbnail_data_url = thumbnail_path
-        .and_then(|path| fs::read(path).ok())
-        .map(|bytes| format!("data:image/jpeg;base64,{}", BASE64.encode(bytes)));
+    let thumbnail = thumbnail_path.and_then(|path| {
+        Path::new(&path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_string)
+    });
     let path: String = row.get(1)?;
     let stored_status: String = row.get(5)?;
     Ok(Screenshot {
@@ -2099,7 +2114,7 @@ fn screenshot_from_row(
         status: file_status(Path::new(&path), stored_status, folders),
         ocr_text: row.get(6)?,
         last_error: row.get(7)?,
-        thumbnail_data_url,
+        thumbnail,
         category: row.get(9)?,
         subcategory: row.get(10)?,
         suggested_category: row.get(11)?,
@@ -2363,6 +2378,33 @@ mod import_tests {
             ),
             "indexed"
         );
+    }
+
+    #[test]
+    fn thumbnail_protocol_serves_only_hash_named_thumbnails() {
+        let fixture = Fixture::new("thumb-protocol");
+        let source = fixture.image("shot.png", 99);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        let name = fs::read_dir(&fixture.thumbnails)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(read_thumbnail(&fixture.thumbnails, &name).is_some());
+        for bad in [
+            "../library.sqlite3",
+            "..%2Flibrary",
+            "",
+            "abc",
+            &name.to_uppercase()[..63],
+        ] {
+            assert!(read_thumbnail(&fixture.thumbnails, bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

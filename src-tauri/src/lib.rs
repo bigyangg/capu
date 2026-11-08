@@ -403,6 +403,33 @@ fn show_main(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Serves thumbnails as images (thumb://localhost/<hash>, or
+        // http://thumb.localhost/<hash> on Windows). Content-addressed, so they cache forever.
+        .register_asynchronous_uri_scheme_protocol("thumb", |context, request, responder| {
+            let thumbnail_dir = context
+                .app_handle()
+                .state::<AppState>()
+                .thumbnail_dir
+                .clone();
+            let name = request.uri().path().trim_start_matches('/').to_string();
+            tauri::async_runtime::spawn_blocking(move || {
+                let response = match library::read_thumbnail(&thumbnail_dir, &name) {
+                    Some(bytes) => tauri::http::Response::builder()
+                        .header(tauri::http::header::CONTENT_TYPE, "image/jpeg")
+                        .header(
+                            tauri::http::header::CACHE_CONTROL,
+                            "public, max-age=31536000, immutable",
+                        )
+                        .body(bytes),
+                    None => tauri::http::Response::builder()
+                        .status(tauri::http::StatusCode::NOT_FOUND)
+                        .body(Vec::new()),
+                };
+                if let Ok(response) = response {
+                    responder.respond(response);
+                }
+            });
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(

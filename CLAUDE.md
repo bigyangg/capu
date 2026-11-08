@@ -11,6 +11,7 @@ Read `README.md` for setup, user workflows, privacy behavior, and current platfo
 - `src/App.tsx`: Main library UI, Tauri command calls, search state, capture and import flows, category presentation, worker lifecycle.
 - `src/App.css`: Frontend layout and visual styles.
 - `src/ocr.worker.ts`: Tesseract OCR, MiniLM text embedding, and CLIP image/query embedding work. Keep CPU-heavy OCR/model work outside the UI thread.
+- `src/modelWorkers.ts`: Starts model workers on demand and terminates them when idle (indexing after 15 s, search after 3 min), because WebAssembly memory is only returned when a worker ends.
 - `src-tauri/src/lib.rs`: Tauri plugins and setup, app state, command registration, default Windows screenshot-folder setup, tray behavior, global shortcuts, autostart.
 - `src-tauri/src/capture.rs`: Native display capture and region selection.
 - `src-tauri/src/folder_watch.rs`: Monitored-folder events (create/modify/remove), debouncing/retries, and import/removal notifications.
