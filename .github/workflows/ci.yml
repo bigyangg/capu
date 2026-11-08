@@ -1,11 +1,11 @@
-# Builds the frontend and runs the Rust tests on Windows and macOS for every push to main
+# Builds the frontend and runs the Rust tests on Windows and macOS for every branch push
 # and every pull request. Compiling on a macOS runner is the only macOS check this project
 # has until the app is built and tested on a Mac.
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
