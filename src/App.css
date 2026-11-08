@@ -878,3 +878,10 @@ body { min-width: 760px; background: #f5f6f7; }
 .shortcut-recorder.recording { border-color: #73a49c; background: #f2f6f5; color: #31494b; }
 .shortcut-recorder kbd { padding: 2px 5px; border: 1px solid #e3e9e7; border-radius: 5px; background: #f7f9f8; color: #31494b; font: inherit; font-size: 10px; }
 .shortcut-reset { margin: 6px 10px 0; }
+
+/* Storage summary in Settings */
+.storage-list { display: grid; gap: 2px; margin: 0; }
+.storage-list > div { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; border-radius: 8px; }
+.storage-list > div:nth-child(odd) { background: #f7f9f8; }
+.storage-list dt { color: #344953; font-size: 12px; font-weight: 600; }
+.storage-list dd { margin: 0; color: #5c7074; font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }

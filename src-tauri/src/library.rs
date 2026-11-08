@@ -68,7 +68,20 @@ pub struct ImportSummary {
     pub duplicates: usize,
     pub failed: usize,
     pub removed: usize,
+    pub moved: usize,
     pub monitored_folders: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct StorageUsage {
+    /// Files kept in the app's own folder: captures made in the app, plus any earlier
+    /// import copy whose original was not available to convert.
+    library_files: u64,
+    library_bytes: u64,
+    /// Screenshots from watched folders, read from where they already are.
+    referenced_files: u64,
+    thumbnail_bytes: u64,
+    database_bytes: u64,
 }
 
 fn connection(db_path: &Path) -> Result<Connection, String> {
@@ -132,6 +145,7 @@ pub fn initialize_database(path: &Path) -> Result<(), String> {
         ("suggested_subcategory", "TEXT"),
         ("category_is_manual", "INTEGER NOT NULL DEFAULT 0"),
         ("source_path", "TEXT"),
+        ("file_modified_ms", "INTEGER"),
     ] {
         let exists: bool = conn
             .query_row(
@@ -521,9 +535,11 @@ pub async fn index_capture_folder(state: State<'_, AppState>) -> Result<IndexRep
     let db_path = state.db_path.clone();
     let thumbnail_dir = state.thumbnail_dir.clone();
     let capture_dir = state.capture_dir.clone();
-    tauri::async_runtime::spawn_blocking(move || scan_folder(&db_path, &thumbnail_dir, &capture_dir))
-        .await
-        .map_err(|error| format!("Indexing task failed: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        scan_folder(&db_path, &thumbnail_dir, &capture_dir)
+    })
+    .await
+    .map_err(|error| format!("Indexing task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -849,7 +865,12 @@ fn is_valid_vector(vector: &[f32], dimensions: usize) -> bool {
     vector.len() == dimensions && vector.iter().all(|value| value.is_finite())
 }
 
-fn store_vector(conn: &Connection, table: VectorTable, id: i64, vector: &[f32]) -> Result<(), String> {
+fn store_vector(
+    conn: &Connection,
+    table: VectorTable,
+    id: i64,
+    vector: &[f32],
+) -> Result<(), String> {
     if !is_valid_vector(vector, table.dimensions()) {
         return Err("The local model returned an invalid vector.".to_string());
     }
@@ -887,7 +908,9 @@ fn similarities(
         let similarity = bytes
             .chunks_exact(4)
             .zip(query)
-            .map(|(bytes, query)| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) * query)
+            .map(|(bytes, query)| {
+                f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) * query
+            })
             .sum::<f32>();
         found.push((id, similarity));
     }
@@ -941,7 +964,9 @@ pub async fn get_unembedded_images(
             )
             .map_err(|error| error.to_string())?;
         let rows = statement
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|error| error.to_string())?;
         let mut jobs = Vec::new();
         for row in rows {
@@ -1046,6 +1071,7 @@ fn scan_folder(db_path: &Path, thumbnail_dir: &Path, folder: &Path) -> Result<In
     })
 }
 
+#[derive(PartialEq, Eq)]
 enum ScanOutcome {
     Indexed,
     Skipped,
@@ -1055,6 +1081,8 @@ enum ScanOutcome {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ImportOutcome {
     Imported,
+    /// An existing entry now follows its renamed or moved original.
+    Moved,
     Duplicate,
     Skipped,
 }
@@ -1066,6 +1094,9 @@ fn is_supported_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Adds a screenshot from a watched folder by reference: the library records where the
+/// original is and keeps only its thumbnail, text, and vectors. The original is never moved,
+/// renamed, copied, or edited.
 pub fn import_monitored_file(
     db_path: &Path,
     thumbnail_dir: &Path,
@@ -1090,132 +1121,86 @@ pub fn import_monitored_file(
     if source.starts_with(&managed_root) || !source.is_file() {
         return Ok(ImportOutcome::Skipped);
     }
+    // Reading an online-only cloud file downloads it. Those are indexed once they are on
+    // this device, so syncing a large cloud folder does not download all of it.
+    if is_online_only(&source) {
+        return Ok(ImportOutcome::Skipped);
+    }
 
-    let (size, modified) = wait_for_import_stable(&source)?;
-    let hash = hash_file(&source)?;
     let conn = connection(db_path)?;
     let source_text = source.to_string_lossy().into_owned();
-    let already_imported: Option<(i64, String, Option<String>)> = conn
+    // A file already in the library with the same size and modified time has not changed,
+    // so it is skipped without reading it again.
+    let metadata = fs::metadata(&source).map_err(|error| error.to_string())?;
+    let unchanged: bool = conn
         .query_row(
-            "SELECT id,file_name,source_path FROM screenshots WHERE file_hash=?1 LIMIT 1",
+            "SELECT EXISTS(SELECT 1 FROM screenshots WHERE path=?1 AND file_size=?2
+             AND file_modified_ms=?3 AND file_hash IS NOT NULL)",
+            params![source_text, metadata.len(), modified_ms(&metadata)],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if unchanged {
+        return Ok(ImportOutcome::Skipped);
+    }
+
+    let stable = wait_for_import_stable(&source)?;
+    let hash = hash_file(&source)?;
+    let same_picture: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id,path FROM screenshots WHERE file_hash=?1 LIMIT 1",
             [&hash],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    if let Some((id, file_name, current_source)) = already_imported {
-        // Track where an imported file lives now: this backfills imports made before
-        // sources were recorded and follows originals that were renamed or moved.
-        // Native captures are never tied to a source, so deleting a copy of one in a
-        // monitored folder cannot remove it from the library.
-        if file_name.starts_with("Imported-")
-            && current_source
-                .as_deref()
-                .is_none_or(|current| current != source_text && source_is_gone(Path::new(current)))
-        {
+    if let Some((id, path)) = same_picture
+        && path != source_text
+    {
+        // The library's file is gone and the same picture appeared here: the original was
+        // renamed or moved, so the entry follows it and keeps its text and category.
+        if source_is_gone(Path::new(&path)) {
+            let file_name = source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Screenshot");
             conn.execute(
-                "UPDATE screenshots SET source_path=?1 WHERE id=?2",
-                params![source_text, id],
+                "UPDATE screenshots SET path=?1,source_path=?1,file_name=?2 WHERE id=?3",
+                params![source_text, file_name, id],
             )
             .map_err(|error| error.to_string())?;
+            return Ok(ImportOutcome::Moved);
         }
         return Ok(ImportOutcome::Duplicate);
     }
 
-    fs::create_dir_all(capture_dir).map_err(|error| error.to_string())?;
-    let ext = source
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("png")
-        .to_ascii_lowercase();
-    let stem = source
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("Screenshot");
-    let readable_stem: String = stem
-        .chars()
-        .filter(|character| {
-            character.is_alphanumeric()
-                || *character == '-'
-                || *character == '_'
-                || *character == ' '
-        })
-        .take(48)
-        .collect();
-    let file_name = format!(
-        "Imported-{}-{}.{}",
-        &hash[..12],
-        if readable_stem.is_empty() {
-            "Screenshot"
-        } else {
-            &readable_stem
-        },
-        ext
-    );
-    let destination = capture_dir.join(file_name);
-    if destination.exists() {
-        if hash_file(&destination)? == hash {
-            return match index_one(&conn, thumbnail_dir, &destination)? {
-                ScanOutcome::Indexed => {
-                    record_import_source(&conn, thumbnail_dir, capture_dir, &source, &destination)?;
-                    Ok(ImportOutcome::Imported)
-                }
-                ScanOutcome::Duplicate => Ok(ImportOutcome::Duplicate),
-                ScanOutcome::Skipped => Ok(ImportOutcome::Skipped),
-            };
-        }
-        return Err("A managed screenshot with the same fingerprint already exists.".to_string());
-    }
-    // A hard link stores the image once on disk while still keeping the library entry
-    // when the original is deleted. It needs the same volume and a regular local file,
-    // so anything else falls back to a verified copy.
-    if supports_hard_link(&source) && fs::hard_link(&source, &destination).is_ok() {
-        let linked = fs::metadata(&destination).map_err(|error| error.to_string())?;
-        if linked.len() != size || linked.modified().ok() != Some(modified) {
-            let _ = fs::remove_file(&destination);
-            return Err(
-                "The screenshot changed while it was being imported. It will be retried."
-                    .to_string(),
-            );
-        }
-    } else {
-        let temporary = capture_dir.join(format!(".import-{hash}.part"));
-        fs::copy(&source, &temporary).map_err(|error| error.to_string())?;
-        let copied_size = fs::metadata(&temporary)
-            .map_err(|error| error.to_string())?
-            .len();
-        if copied_size != size || hash_file(&temporary)? != hash {
-            let _ = fs::remove_file(&temporary);
-            return Err(
-                "The screenshot changed while it was being imported. It will be retried."
-                    .to_string(),
-            );
-        }
-        fs::rename(&temporary, &destination).map_err(|error| {
-            let _ = fs::remove_file(&temporary);
-            error.to_string()
-        })?;
-        if let Err(error) =
-            filetime::set_file_mtime(&destination, filetime::FileTime::from_system_time(modified))
-        {
-            let _ = fs::remove_file(&destination);
-            return Err(error.to_string());
-        }
-    }
+    // An original edited in place keeps its entry: the same row is updated and re-read.
+    let outcome = index_file(&conn, thumbnail_dir, &source, stable, hash)?;
+    conn.execute(
+        "UPDATE screenshots SET source_path=?1 WHERE path=?1",
+        [&source_text],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(match outcome {
+        ScanOutcome::Indexed => ImportOutcome::Imported,
+        ScanOutcome::Duplicate => ImportOutcome::Duplicate,
+        ScanOutcome::Skipped => ImportOutcome::Skipped,
+    })
+}
 
-    match index_one(&conn, thumbnail_dir, &destination) {
-        Ok(ScanOutcome::Indexed) => {
-            record_import_source(&conn, thumbnail_dir, capture_dir, &source, &destination)?;
-            Ok(ImportOutcome::Imported)
-        }
-        Ok(ScanOutcome::Duplicate) => {
-            let _ = fs::remove_file(&destination);
-            Ok(ImportOutcome::Duplicate)
-        }
-        Ok(ScanOutcome::Skipped) => Ok(ImportOutcome::Skipped),
-        Err(error) => {
-            let _ = fs::remove_file(&destination);
-            Err(error)
+/// Counts the screenshots added and followed after a rename for one watcher event.
+#[derive(Default)]
+pub struct EventChanges {
+    pub imported: usize,
+    pub moved: usize,
+}
+
+impl EventChanges {
+    fn add(&mut self, outcome: ImportOutcome) {
+        match outcome {
+            ImportOutcome::Imported => self.imported += 1,
+            ImportOutcome::Moved => self.moved += 1,
+            ImportOutcome::Duplicate | ImportOutcome::Skipped => {}
         }
     }
 }
@@ -1226,30 +1211,206 @@ pub fn import_monitored_event(
     capture_dir: &Path,
     monitored_roots: &[PathBuf],
     event_path: &Path,
-) -> Result<usize, String> {
+) -> Result<EventChanges, String> {
+    let mut changes = EventChanges::default();
     if event_path.is_dir() {
         let mut paths = Vec::new();
         walk_directory(event_path, &mut paths)?;
-        let mut imported = 0;
         for path in paths {
-            if import_monitored_file(db_path, thumbnail_dir, capture_dir, monitored_roots, &path)?
-                == ImportOutcome::Imported
-            {
-                imported += 1;
-            }
-        }
-        Ok(imported)
-    } else {
-        Ok(usize::from(
-            import_monitored_file(
+            changes.add(import_monitored_file(
                 db_path,
                 thumbnail_dir,
                 capture_dir,
                 monitored_roots,
-                event_path,
-            )? == ImportOutcome::Imported,
-        ))
+                &path,
+            )?);
+        }
+    } else {
+        changes.add(import_monitored_file(
+            db_path,
+            thumbnail_dir,
+            capture_dir,
+            monitored_roots,
+            event_path,
+        )?);
     }
+    Ok(changes)
+}
+
+/// Earlier versions kept a hard link or copy of every imported screenshot in the app's
+/// folder. This points those entries at their originals and removes the app's duplicate,
+/// so each picture is stored once. Only exact matches are converted: if the original is
+/// missing, changed, or online-only, the app's copy is kept. It also marks entries from the
+/// retired in-place "library folder" flow as references, so deleting their originals is
+/// handled like any other watched file. Returns the number of entries converted.
+pub fn convert_imports_to_references(
+    db_path: &Path,
+    thumbnail_dir: &Path,
+    capture_dir: &Path,
+) -> Result<usize, String> {
+    let conn = connection(db_path)?;
+    let managed_root = fs::canonicalize(capture_dir).unwrap_or_else(|_| capture_dir.to_path_buf());
+    let rows = conn
+        .prepare(
+            "SELECT id,path,source_path,file_hash,thumbnail_path FROM screenshots
+             WHERE source_path IS NULL OR path != source_path",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+
+    let mut converted = 0;
+    for (id, path, source, hash, thumbnail) in rows {
+        let in_library = Path::new(&path).starts_with(&managed_root);
+        let Some(source) = source else {
+            if !in_library {
+                conn.execute("UPDATE screenshots SET source_path=path WHERE id=?1", [id])
+                    .map_err(|error| error.to_string())?;
+            }
+            continue;
+        };
+        let original = Path::new(&source);
+        if !in_library || !original.is_file() || is_online_only(original) {
+            continue;
+        }
+        if hash.is_none() || hash_file(original).ok() != hash {
+            continue;
+        }
+        let already_referenced: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM screenshots WHERE path=?1)",
+                [&source],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if already_referenced {
+            delete_library_item(
+                &conn,
+                thumbnail_dir,
+                capture_dir,
+                id,
+                &path,
+                thumbnail.as_deref(),
+            )?;
+        } else {
+            let metadata = fs::metadata(original).map_err(|error| error.to_string())?;
+            let file_name = original
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Screenshot");
+            conn.execute(
+                "UPDATE screenshots SET path=?1,file_name=?2,file_modified_ms=?3 WHERE id=?4",
+                params![source, file_name, modified_ms(&metadata), id],
+            )
+            .map_err(|error| error.to_string())?;
+            let _ = fs::remove_file(&path);
+        }
+        converted += 1;
+    }
+    Ok(converted)
+}
+
+pub fn storage_usage(
+    db_path: &Path,
+    thumbnail_dir: &Path,
+    capture_dir: &Path,
+) -> Result<StorageUsage, String> {
+    let folder_size = |folder: &Path| -> (u64, u64) {
+        fs::read_dir(folder)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| entry.metadata().ok())
+                    .filter(|metadata| metadata.is_file())
+                    .fold((0, 0), |(count, bytes), metadata| {
+                        (count + 1, bytes + metadata.len())
+                    })
+            })
+            .unwrap_or((0, 0))
+    };
+    let (library_files, library_bytes) = folder_size(capture_dir);
+    let (_, thumbnail_bytes) = folder_size(thumbnail_dir);
+    let database_bytes = ["", "-wal", "-shm"]
+        .iter()
+        .filter_map(|suffix| {
+            let mut name = db_path.as_os_str().to_owned();
+            name.push(suffix);
+            fs::metadata(PathBuf::from(name)).ok()
+        })
+        .map(|metadata| metadata.len())
+        .sum();
+    let managed_root = fs::canonicalize(capture_dir).unwrap_or_else(|_| capture_dir.to_path_buf());
+    let conn = connection(db_path)?;
+    let mut statement = conn
+        .prepare("SELECT path FROM screenshots")
+        .map_err(|error| error.to_string())?;
+    let referenced_files = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .filter(|path| !Path::new(path).starts_with(&managed_root))
+        .count() as u64;
+    Ok(StorageUsage {
+        library_files,
+        library_bytes,
+        referenced_files,
+        thumbnail_bytes,
+        database_bytes,
+    })
+}
+
+#[tauri::command]
+pub async fn get_storage_usage(state: State<'_, AppState>) -> Result<StorageUsage, String> {
+    let db_path = state.db_path.clone();
+    let thumbnail_dir = state.thumbnail_dir.clone();
+    let capture_dir = state.capture_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        storage_usage(&db_path, &thumbnail_dir, &capture_dir)
+    })
+    .await
+    .map_err(|error| format!("Storage check failed: {error}"))?
+}
+
+/// Opens a library screenshot in the system's default image viewer. The path comes from
+/// the library, not from the web view.
+#[tauri::command]
+pub async fn open_screenshot(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let db_path = state.db_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = screenshot_path_for_id(&db_path, id)?;
+        tauri_plugin_opener::open_path(shell_path(&path), None::<&str>)
+            .map_err(|error| format!("Could not open the screenshot: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Open task failed: {error}"))?
+}
+
+/// Windows canonical paths carry a `\\?\` prefix that some shell APIs reject.
+fn shell_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+fn modified_ms(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .unwrap_or(UNIX_EPOCH)
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 fn wait_for_import_stable(path: &Path) -> Result<(u64, SystemTime), String> {
@@ -1285,89 +1446,22 @@ fn source_is_gone(path: &Path) -> bool {
     matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// True for a cloud placeholder whose contents are not on this device (OneDrive and other
+/// Windows cloud-sync clients). Reading such a file downloads it.
 #[cfg(windows)]
-fn supports_hard_link(path: &Path) -> bool {
+fn is_online_only(path: &Path) -> bool {
     use std::os::windows::fs::MetadataExt;
-    // Cloud-synced files are copied instead of linked. The sync client can later turn a
-    // local file into an online-only placeholder, and every hard link shares that change.
-    // OneDrive folders are excluded by location because a fully local file there carries
-    // no cloud attributes until that happens.
-    const UNLINKABLE: u32 = 0x400 // FILE_ATTRIBUTE_REPARSE_POINT
-        | 0x1000 // FILE_ATTRIBUTE_OFFLINE
+    const NOT_LOCAL: u32 = 0x1000 // FILE_ATTRIBUTE_OFFLINE
         | 0x40000 // FILE_ATTRIBUTE_RECALL_ON_OPEN
-        | 0x80000 // FILE_ATTRIBUTE_PINNED
-        | 0x100000 // FILE_ATTRIBUTE_UNPINNED
         | 0x400000; // FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
-    let in_onedrive = ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .filter_map(|root| fs::canonicalize(root).ok())
-        .any(|root| path.starts_with(root));
-    !in_onedrive
-        && fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_attributes() & UNLINKABLE == 0)
+    fs::metadata(path)
+        .map(|metadata| metadata.file_attributes() & NOT_LOCAL != 0)
         .unwrap_or(false)
 }
 
 #[cfg(not(windows))]
-fn supports_hard_link(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
-}
-
-fn record_import_source(
-    conn: &Connection,
-    thumbnail_dir: &Path,
-    capture_dir: &Path,
-    source: &Path,
-    destination: &Path,
-) -> Result<(), String> {
-    let source_text = source.to_string_lossy().into_owned();
-    let destination_text = fs::canonicalize(destination)
-        .map_err(|error| error.to_string())?
-        .to_string_lossy()
-        .into_owned();
-    conn.execute(
-        "UPDATE screenshots SET source_path=?1 WHERE path=?2",
-        params![source_text, destination_text],
-    )
-    .map_err(|error| error.to_string())?;
-
-    // An original edited in place replaces the version imported before it. A category
-    // chosen by hand carries over to the new version.
-    let mut statement = conn
-        .prepare(
-            "SELECT id,path,thumbnail_path,category_is_manual,category,subcategory
-             FROM screenshots WHERE source_path=?1 AND path!=?2",
-        )
-        .map_err(|error| error.to_string())?;
-    let previous = statement
-        .query_map(params![source_text, destination_text], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, i64>(3)? != 0,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })
-        .map_err(|error| error.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    drop(statement);
-    for (id, path, thumbnail, manual, category, subcategory) in previous {
-        if manual {
-            conn.execute(
-                "UPDATE screenshots SET category_is_manual=1,category=?1,subcategory=?2 WHERE path=?3",
-                params![category, subcategory, destination_text],
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        delete_library_item(conn, thumbnail_dir, capture_dir, id, &path, thumbnail.as_deref())?;
-    }
-    Ok(())
+fn is_online_only(_path: &Path) -> bool {
+    false
 }
 
 /// Removes a screenshot and everything derived from it: search text, embedding,
@@ -1388,10 +1482,16 @@ fn delete_library_item(
         .execute("DELETE FROM screenshot_fts WHERE screenshot_id=?1", [id])
         .map_err(|error| error.to_string())?;
     transaction
-        .execute("DELETE FROM screenshot_embeddings WHERE screenshot_id=?1", [id])
+        .execute(
+            "DELETE FROM screenshot_embeddings WHERE screenshot_id=?1",
+            [id],
+        )
         .map_err(|error| error.to_string())?;
     transaction
-        .execute("DELETE FROM screenshot_image_embeddings WHERE screenshot_id=?1", [id])
+        .execute(
+            "DELETE FROM screenshot_image_embeddings WHERE screenshot_id=?1",
+            [id],
+        )
         .map_err(|error| error.to_string())?;
     transaction
         .execute("DELETE FROM screenshots WHERE id=?1", [id])
@@ -1447,7 +1547,14 @@ fn remove_items_with_missing_sources(
     for (id, path, source, thumbnail) in rows {
         let source = Path::new(&source);
         if belongs(source) && source_is_gone(source) {
-            delete_library_item(&conn, thumbnail_dir, capture_dir, id, &path, thumbnail.as_deref())?;
+            delete_library_item(
+                &conn,
+                thumbnail_dir,
+                capture_dir,
+                id,
+                &path,
+                thumbnail.as_deref(),
+            )?;
             removed += 1;
         }
     }
@@ -1467,7 +1574,9 @@ pub fn remove_deleted_source(
     // The removed path cannot be canonicalized, so resolve its parent to match the
     // canonical form stored for sources.
     let removed = match (
-        removed.parent().and_then(|parent| fs::canonicalize(parent).ok()),
+        removed
+            .parent()
+            .and_then(|parent| fs::canonicalize(parent).ok()),
         removed.file_name(),
     ) {
         (Some(parent), Some(name)) => parent.join(name),
@@ -1491,7 +1600,10 @@ fn reconcile_deleted_sources(
     capture_dir: &Path,
     roots: &[PathBuf],
 ) -> Result<usize, String> {
-    let available = roots.iter().filter(|root| root.is_dir()).collect::<Vec<_>>();
+    let available = roots
+        .iter()
+        .filter(|root| root.is_dir())
+        .collect::<Vec<_>>();
     if available.is_empty() {
         return Ok(0);
     }
@@ -1511,6 +1623,7 @@ pub fn import_monitored_folders(
         duplicates: 0,
         failed: 0,
         removed: 0,
+        moved: 0,
         monitored_folders: roots
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
@@ -1525,6 +1638,7 @@ pub fn import_monitored_folders(
         for path in paths {
             match import_monitored_file(db_path, thumbnail_dir, capture_dir, roots, &path) {
                 Ok(ImportOutcome::Imported) => summary.imported += 1,
+                Ok(ImportOutcome::Moved) => summary.moved += 1,
                 Ok(ImportOutcome::Duplicate) => summary.duplicates += 1,
                 Ok(ImportOutcome::Skipped) => {}
                 Err(_) => summary.failed += 1,
@@ -1565,7 +1679,19 @@ fn walk_directory(path: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
 
 fn index_one(conn: &Connection, thumbnail_dir: &Path, path: &Path) -> Result<ScanOutcome, String> {
     let path = fs::canonicalize(path).map_err(|error| error.to_string())?;
-    let (size, modified) = wait_for_stable_file(&path)?;
+    let stable = wait_for_stable_file(&path)?;
+    let hash = hash_file(&path)?;
+    index_file(conn, thumbnail_dir, &path, stable, hash)
+}
+
+/// Adds or refreshes the library row for a canonical, stable file whose hash is known.
+fn index_file(
+    conn: &Connection,
+    thumbnail_dir: &Path,
+    path: &Path,
+    (size, modified): (u64, SystemTime),
+    hash: String,
+) -> Result<ScanOutcome, String> {
     let path_text = path.to_string_lossy().into_owned();
     let file_name = path
         .file_name()
@@ -1576,22 +1702,31 @@ fn index_one(conn: &Connection, thumbnail_dir: &Path, path: &Path) -> Result<Sca
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
+    let modified_ms = modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
 
-    let existing: Option<(i64, u64, Option<String>, String)> = conn
+    let existing: Option<(i64, u64, Option<String>, String, Option<String>)> = conn
         .query_row(
-            "SELECT id, file_size, file_hash, status FROM screenshots WHERE path = ?1",
+            "SELECT id, file_size, file_hash, status, thumbnail_path FROM screenshots WHERE path = ?1",
             [&path_text],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .optional()
         .map_err(|error| error.to_string())?;
 
-    let hash = hash_file(&path)?;
-
-    if let Some((_, old_size, Some(old_hash), status)) = &existing {
-        if *old_size == size && old_hash == &hash && status == "indexed" {
-            return Ok(ScanOutcome::Skipped);
-        }
+    if let Some((id, old_size, Some(old_hash), status, _)) = &existing
+        && *old_size == size
+        && old_hash == &hash
+        && status != "error"
+    {
+        conn.execute(
+            "UPDATE screenshots SET file_modified_ms=?1 WHERE id=?2",
+            params![modified_ms, id],
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(ScanOutcome::Skipped);
     }
 
     let duplicate: Option<i64> = conn
@@ -1603,11 +1738,14 @@ fn index_one(conn: &Connection, thumbnail_dir: &Path, path: &Path) -> Result<Sca
         .optional()
         .map_err(|error| error.to_string())?;
     if duplicate.is_some() {
-        if let Some((id, _, _, _)) = existing {
+        if let Some((id, _, _, _, _)) = existing {
             conn.execute("DELETE FROM screenshot_fts WHERE screenshot_id = ?1", [id])
                 .map_err(|error| error.to_string())?;
-            conn.execute("DELETE FROM screenshot_embeddings WHERE screenshot_id = ?1", [id])
-                .map_err(|error| error.to_string())?;
+            conn.execute(
+                "DELETE FROM screenshot_embeddings WHERE screenshot_id = ?1",
+                [id],
+            )
+            .map_err(|error| error.to_string())?;
             conn.execute(
                 "DELETE FROM screenshot_image_embeddings WHERE screenshot_id = ?1",
                 [id],
@@ -1620,7 +1758,7 @@ fn index_one(conn: &Connection, thumbnail_dir: &Path, path: &Path) -> Result<Sca
     }
 
     let image =
-        image::open(&path).map_err(|error| format!("Unsupported or damaged image: {error}"))?;
+        image::open(path).map_err(|error| format!("Unsupported or damaged image: {error}"))?;
     let thumbnail_path = thumbnail_dir.join(format!("{hash}.jpg"));
     if !thumbnail_path.exists() {
         let thumbnail = image::DynamicImage::ImageRgb8(image.thumbnail(480, 320).to_rgb8());
@@ -1632,13 +1770,35 @@ fn index_one(conn: &Connection, thumbnail_dir: &Path, path: &Path) -> Result<Sca
     }
     let thumb_text = thumbnail_path.to_string_lossy().into_owned();
     match existing {
-        Some((id, _, _, _)) => {
+        Some((id, _, _, _, old_thumbnail)) => {
             conn.execute(
                 "UPDATE screenshots SET file_hash=?1, file_name=?2, captured_at=?3, file_size=?4,
-                 status='pending', ocr_text='', last_error=NULL, thumbnail_path=?5 WHERE id=?6",
-                params![hash, file_name, captured_at, size, thumb_text, id],
+                 status='pending', ocr_text='', last_error=NULL, thumbnail_path=?5,
+                 file_modified_ms=?6 WHERE id=?7",
+                params![
+                    hash,
+                    file_name,
+                    captured_at,
+                    size,
+                    thumb_text,
+                    modified_ms,
+                    id
+                ],
             )
             .map_err(|error| error.to_string())?;
+            // The file changed, so the previous version's thumbnail is no longer needed.
+            if let Some(old) = old_thumbnail.filter(|old| *old != thumb_text) {
+                let still_used: bool = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM screenshots WHERE thumbnail_path=?1)",
+                        [&old],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !still_used && Path::new(&old).starts_with(thumbnail_dir) {
+                    let _ = fs::remove_file(&old);
+                }
+            }
             conn.execute("DELETE FROM screenshot_fts WHERE screenshot_id=?1", [id])
                 .map_err(|error| error.to_string())?;
             conn.execute(
@@ -1654,9 +1814,9 @@ fn index_one(conn: &Connection, thumbnail_dir: &Path, path: &Path) -> Result<Sca
         }
         None => {
             conn.execute(
-                "INSERT INTO screenshots(path,file_hash,file_name,captured_at,file_size,status,thumbnail_path)
-                 VALUES(?1,?2,?3,?4,?5,'pending',?6)",
-                params![path_text, hash, file_name, captured_at, size, thumb_text],
+                "INSERT INTO screenshots(path,file_hash,file_name,captured_at,file_size,status,thumbnail_path,file_modified_ms)
+                 VALUES(?1,?2,?3,?4,?5,'pending',?6,?7)",
+                params![path_text, hash, file_name, captured_at, size, thumb_text, modified_ms],
             ).map_err(|error| error.to_string())?;
         }
     }
@@ -1835,10 +1995,16 @@ mod import_tests {
         fn new(name: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "screenshot-memory-{name}-{}",
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
-            let (watched, captures, thumbnails) =
-                (root.join("watched"), root.join("captures"), root.join("thumbnails"));
+            let (watched, captures, thumbnails) = (
+                root.join("watched"),
+                root.join("captures"),
+                root.join("thumbnails"),
+            );
             for dir in [&watched, &captures, &thumbnails] {
                 fs::create_dir_all(dir).unwrap();
             }
@@ -1902,27 +2068,42 @@ mod import_tests {
         }
     }
 
+    fn source_text(path: &Path) -> String {
+        fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
-    fn deleting_an_original_removes_its_library_entry_and_files() {
-        let fixture = Fixture::new("delete");
+    fn imports_reference_the_original_without_copying_it() {
+        let fixture = Fixture::new("reference");
         let source = fixture.image("shot.png", 10);
         assert!(fixture.import(&source) == ImportOutcome::Imported);
         let rows = fixture.rows();
         assert_eq!(rows.len(), 1);
-        let (library_path, recorded_source) = rows[0].clone();
-        assert_eq!(
-            recorded_source.as_deref(),
-            Some(fs::canonicalize(&source).unwrap().to_string_lossy().as_ref())
-        );
+        assert_eq!(rows[0].0, source_text(&source));
+        assert_eq!(rows[0].1.as_deref(), Some(source_text(&source).as_str()));
+        assert_eq!(fs::read_dir(&fixture.captures).unwrap().count(), 0);
+        assert!(source.is_file());
+    }
 
+    #[test]
+    fn unchanged_files_are_skipped_on_the_next_sync() {
+        let fixture = Fixture::new("unchanged");
+        let source = fixture.image("shot.png", 15);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
+        assert!(fixture.import(&source) == ImportOutcome::Skipped);
+    }
+
+    #[test]
+    fn deleting_an_original_removes_its_library_entry() {
+        let fixture = Fixture::new("delete");
+        let source = fixture.image("shot.png", 10);
+        assert!(fixture.import(&source) == ImportOutcome::Imported);
         fs::remove_file(&source).unwrap();
-        assert!(
-            Path::new(&library_path).is_file(),
-            "the library entry outlives its original until the deletion is handled"
-        );
         assert_eq!(fixture.remove(&source), 1);
         assert!(fixture.rows().is_empty());
-        assert!(!Path::new(&library_path).exists());
         assert_eq!(fs::read_dir(&fixture.thumbnails).unwrap().count(), 0);
     }
 
@@ -1934,30 +2115,77 @@ mod import_tests {
         let renamed = fixture.watched.join("after.png");
         fs::rename(&source, &renamed).unwrap();
 
-        assert!(fixture.import(&renamed) == ImportOutcome::Duplicate);
+        assert!(fixture.import(&renamed) == ImportOutcome::Moved);
         assert_eq!(fixture.remove(&source), 0);
         let rows = fixture.rows();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].1.as_deref(),
-            Some(renamed.to_string_lossy().as_ref())
-        );
+        assert_eq!(rows[0].0, source_text(&renamed));
+        assert_eq!(rows[0].1.as_deref(), Some(source_text(&renamed).as_str()));
     }
 
     #[test]
-    fn edited_original_replaces_the_previous_version() {
+    fn edited_original_updates_the_same_entry() {
         let fixture = Fixture::new("edit");
         let source = fixture.image("shot.png", 30);
         assert!(fixture.import(&source) == ImportOutcome::Imported);
-        let (first_path, _) = fixture.rows()[0].clone();
-
-        fs::remove_file(&source).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
         let source = fixture.image("shot.png", 40);
         assert!(fixture.import(&source) == ImportOutcome::Imported);
         let rows = fixture.rows();
         assert_eq!(rows.len(), 1);
-        assert_ne!(rows[0].0, first_path);
-        assert!(!Path::new(&first_path).exists());
+        assert_eq!(rows[0].0, source_text(&source));
+        assert_eq!(
+            fs::read_dir(&fixture.thumbnails).unwrap().count(),
+            1,
+            "the earlier version's thumbnail is removed"
+        );
+    }
+
+    #[test]
+    fn earlier_import_copies_are_converted_to_references() {
+        let fixture = Fixture::new("convert");
+        let source = fixture.image("shot.png", 50);
+        let copy = fixture.captures.join("Imported-0123456789ab-shot.png");
+        fs::copy(&source, &copy).unwrap();
+        let conn = connection(&fixture.db).unwrap();
+        assert!(index_one(&conn, &fixture.thumbnails, &copy).unwrap() == ScanOutcome::Indexed);
+        conn.execute(
+            "UPDATE screenshots SET source_path=?1",
+            [source_text(&source)],
+        )
+        .unwrap();
+
+        let converted =
+            convert_imports_to_references(&fixture.db, &fixture.thumbnails, &fixture.captures)
+                .unwrap();
+        assert_eq!(converted, 1);
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, source_text(&source));
+        assert!(!copy.exists(), "the app's duplicate is removed");
+        assert!(source.is_file(), "the original is untouched");
+    }
+
+    #[test]
+    fn a_copy_whose_original_changed_is_kept() {
+        let fixture = Fixture::new("keep-copy");
+        let source = fixture.image("shot.png", 60);
+        let copy = fixture.captures.join("Imported-0123456789ab-shot.png");
+        fs::copy(&source, &copy).unwrap();
+        let conn = connection(&fixture.db).unwrap();
+        index_one(&conn, &fixture.thumbnails, &copy).unwrap();
+        conn.execute(
+            "UPDATE screenshots SET source_path=?1",
+            [source_text(&source)],
+        )
+        .unwrap();
+        fixture.image("shot.png", 70);
+
+        let converted =
+            convert_imports_to_references(&fixture.db, &fixture.thumbnails, &fixture.captures)
+                .unwrap();
+        assert_eq!(converted, 0);
+        assert!(copy.is_file());
     }
 }
 
@@ -1985,7 +2213,8 @@ mod visual_search_tests {
         .unwrap();
         for (index, values) in vectors.iter().enumerate() {
             let id = index as i64 + 1;
-            conn.execute("INSERT INTO screenshots(id) VALUES(?1)", [id]).unwrap();
+            conn.execute("INSERT INTO screenshots(id) VALUES(?1)", [id])
+                .unwrap();
             store_vector(&conn, VectorTable::Image, id, values).unwrap();
         }
         conn
@@ -2019,8 +2248,17 @@ mod visual_search_tests {
     #[test]
     fn rejects_vectors_of_the_wrong_size() {
         let conn = library_with_images(&[]);
-        conn.execute("INSERT INTO screenshots(id) VALUES(1)", []).unwrap();
-        assert!(store_vector(&conn, VectorTable::Image, 1, &[0.5; TEXT_EMBEDDING_DIMENSIONS]).is_err());
+        conn.execute("INSERT INTO screenshots(id) VALUES(1)", [])
+            .unwrap();
+        assert!(
+            store_vector(
+                &conn,
+                VectorTable::Image,
+                1,
+                &[0.5; TEXT_EMBEDDING_DIMENSIONS]
+            )
+            .is_err()
+        );
     }
 }
 

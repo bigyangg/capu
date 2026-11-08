@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent a
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { openPath } from "@tauri-apps/plugin-opener";
 import {
   AlertCircle,
   ArrowDownWideNarrow,
@@ -57,6 +56,14 @@ type IndexReport = {
   duplicates: number;
   failed: number;
   screenshots: Screenshot[];
+};
+
+type StorageUsage = {
+  library_files: number;
+  library_bytes: number;
+  referenced_files: number;
+  thumbnail_bytes: number;
+  database_bytes: number;
 };
 
 type ImportSummary = {
@@ -331,6 +338,7 @@ function LibraryApp() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [storage, setStorage] = useState<StorageUsage | null>(null);
   const [captureMode, setCaptureMode] = useState<"active" | "all">("active");
   const [autostart, setAutostart] = useState(false);
   const [captureStatus, setCaptureStatus] = useState<string | null>(null);
@@ -617,10 +625,12 @@ function LibraryApp() {
       try {
         const current = await invoke<Screenshot[]>("list_screenshots");
         setItems(current);
-        const importedCount = Number.parseInt(event.payload, 10) || 1;
-        setRecentImportCount(importedCount);
-        setNotice(`${importedCount} new screenshot${importedCount === 1 ? "" : "s"} added to your library.`);
-        setError(null);
+        const importedCount = Number.parseInt(event.payload, 10) || 0;
+        if (importedCount > 0) {
+          setRecentImportCount(importedCount);
+          setNotice(`${importedCount} new screenshot${importedCount === 1 ? "" : "s"} added to your library.`);
+          setError(null);
+        }
         await runOcr(current);
       } catch (cause) {
         setError(`Could not refresh the imported screenshots: ${String(cause)}`);
@@ -669,6 +679,15 @@ function LibraryApp() {
       setError(`Could not stop monitoring that folder: ${String(cause)}`);
     }
   };
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    let cancelled = false;
+    void invoke<StorageUsage>("get_storage_usage")
+      .then((usage) => { if (!cancelled) setStorage(usage); })
+      .catch((cause) => { if (!cancelled) setError(`Could not check storage: ${String(cause)}`); });
+    return () => { cancelled = true; };
+  }, [settingsOpen]);
 
   const updateShortcuts = async (fullScreen: string, region: string) => {
     setShortcutBusy(true);
@@ -810,7 +829,7 @@ function LibraryApp() {
   const openScreenshot = async (item: Screenshot) => {
     setError(null);
     try {
-      await openPath(item.path);
+      await invoke("open_screenshot", { id: item.id });
     } catch (cause) {
       setError(`Could not open the original screenshot: ${String(cause)}`);
     }
@@ -1075,7 +1094,7 @@ function LibraryApp() {
           <h3>Automatic importing</h3>
           <p>{platform === "windows"
             ? "Screenshot Memory manages its private library automatically. Windows Snipping Tool captures are watched by default; add another folder only if you want screenshots from a different location. Originals stay in place."
-            : "Screenshot Memory manages its private library automatically. Add a folder to import the screenshots saved there and any new ones. Originals stay in place."}</p>
+            : "Screenshot Memory manages its private library automatically. Add a folder to import the screenshots saved there and any new ones. Originals stay in place."}{" "}Screenshots from watched folders are not copied: the library reads them where they are.</p>
           <button className="button secondary-button monitor-add" onClick={() => void addMonitoredFolder()} disabled={monitorBusy}>
             {monitorBusy ? <LoaderCircle size={14} className="spin" /> : <FolderOpen size={14} />}
             {monitorBusy ? "Adding folder..." : "Add folder to watch"}
@@ -1086,6 +1105,13 @@ function LibraryApp() {
               <button className="icon-button" onClick={() => void removeMonitoredFolder(path)} aria-label={`Stop monitoring ${path}`} title="Stop monitoring"><X size={14} /></button>
             </div>)}
           </div> : <div className="monitor-empty">No monitored folders yet.</div>}
+        </div>
+        <div className="settings-section"><h3>Storage</h3><p>Each screenshot from a watched folder adds only a small preview and its search data. Deleting the original removes it from the library.</p>
+          {storage ? <dl className="storage-list">
+            <div><dt>Captured in Screenshot Memory</dt><dd>{storage.library_files ? `${storage.library_files} file${storage.library_files === 1 ? "" : "s"} · ${formatBytes(storage.library_bytes)}` : "None yet"}</dd></div>
+            <div><dt>From watched folders</dt><dd>{storage.referenced_files} file{storage.referenced_files === 1 ? "" : "s"} · no extra copy</dd></div>
+            <div><dt>Previews and search data</dt><dd>{formatBytes(storage.thumbnail_bytes + storage.database_bytes)}</dd></div>
+          </dl> : <div className="monitor-empty">Checking storage…</div>}
         </div>
         <div className="settings-section"><h3>Full screen capture</h3><p>Choose which display {fullScreenLabel ?? "the full-screen shortcut"} captures.</p>
           <label className="setting-choice"><input type="radio" name="capture-mode" checked={captureMode === "active"} onChange={() => { setCaptureMode("active"); void invoke("set_capture_display_mode", { mode: "active" }).catch((cause) => setError(String(cause))); }} /><span><strong>Active display</strong><small>Capture the display under your pointer.</small></span></label>

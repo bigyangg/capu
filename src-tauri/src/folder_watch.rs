@@ -72,6 +72,7 @@ impl FolderWatchService {
                     // original re-points its library entry instead of being removed.
                     ready.sort_by_key(|path| !path.exists());
                     let mut imported = 0;
+                    let mut moved = 0;
                     let mut removed = 0;
                     let mut first_failure = None;
                     for path in ready {
@@ -110,7 +111,10 @@ impl FolderWatchService {
                             &monitored,
                             &path,
                         ) {
-                            Ok(count) => imported += count,
+                            Ok(changes) => {
+                                imported += changes.imported;
+                                moved += changes.moved;
+                            }
                             Err(error) => {
                                 if path.exists() && attempts < 4 {
                                     let delay = Duration::from_millis(500 * (1 << attempts));
@@ -123,7 +127,9 @@ impl FolderWatchService {
                             }
                         }
                     }
-                    if imported > 0 {
+                    // The payload counts new screenshots; "0" means entries only followed
+                    // renamed or moved originals, so the UI refreshes without a notice.
+                    if imported > 0 || moved > 0 {
                         let _ = app.emit("library-changed", imported.to_string());
                     }
                     if removed > 0 {

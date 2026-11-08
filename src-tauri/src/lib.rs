@@ -457,6 +457,15 @@ pub fn run() {
                 let Ok(_guard) = startup_lock.lock() else {
                     return;
                 };
+                let converted = library::convert_imports_to_references(
+                    &startup_db,
+                    &startup_thumbnails,
+                    &startup_captures,
+                )
+                .unwrap_or_else(|error| {
+                    eprintln!("Could not convert earlier import copies: {error}");
+                    0
+                });
                 let Ok(configured) = library::monitored_folders_from_db(&startup_db) else {
                     return;
                 };
@@ -471,7 +480,7 @@ pub fn run() {
                     &startup_captures,
                     &roots,
                 );
-                if report.imported > 0 {
+                if report.imported > 0 || report.moved > 0 || converted > 0 {
                     let _ = startup_app.emit("library-changed", report.imported.to_string());
                 }
                 if report.removed > 0 {
@@ -595,6 +604,8 @@ pub fn run() {
             library::get_screenshot_preview,
             library::copy_screenshot_image_to_clipboard,
             library::save_screenshot_copy,
+            library::open_screenshot,
+            library::get_storage_usage,
             library::save_ocr_text,
             library::save_semantic_embedding,
             library::get_unembedded_texts,
